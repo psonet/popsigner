@@ -23,9 +23,10 @@ type BaoKeyringInterface interface {
 	// Returns the public key bytes, address, and Ethereum address.
 	NewAccountWithOptions(uid string, opts KeyOptions) (pubKey []byte, address string, ethAddress string, err error)
 
-	// Sign signs a message with the given key.
+	// Sign signs a message with the given key. When prehashed is true, msg is
+	// a 32-byte digest the engine must sign as-is rather than hash again.
 	// Returns the signature and public key.
-	Sign(uid string, msg []byte) (signature []byte, pubKey []byte, err error)
+	Sign(uid string, msg []byte, prehashed bool) (signature []byte, pubKey []byte, err error)
 
 	// Delete removes a key from OpenBao.
 	Delete(uid string) error
@@ -381,7 +382,7 @@ func (s *keyService) Sign(ctx context.Context, orgID, keyID uuid.UUID, data []by
 	}
 
 	// Sign via BaoKeyring
-	sig, pubKey, err := s.baoKeyring.Sign(key.BaoKeyPath, data)
+	sig, pubKey, err := s.baoKeyring.Sign(key.BaoKeyPath, data, prehashed)
 	if err != nil {
 		return nil, apierrors.NewInternalError(fmt.Sprintf("signing failed: %v", err))
 	}

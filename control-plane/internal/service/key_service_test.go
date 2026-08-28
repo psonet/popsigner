@@ -525,7 +525,7 @@ func (m *mockBaoKeyring) NewAccountWithOptions(uid string, opts KeyOptions) ([]b
 	return pubKey, address, ethAddress, nil
 }
 
-func (m *mockBaoKeyring) Sign(uid string, msg []byte) ([]byte, []byte, error) {
+func (m *mockBaoKeyring) Sign(uid string, msg []byte, prehashed bool) ([]byte, []byte, error) {
 	key, ok := m.keys[uid]
 	if !ok {
 		return nil, nil, apierrors.NewNotFoundError("Key")
