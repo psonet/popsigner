@@ -68,10 +68,20 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 	cookieDomain = cfg.Auth.CookieDomain
+	if err := service.ValidateLoginAllowlist(cfg.Auth.AllowedEmailDomains, cfg.Auth.AllowedEmails); err != nil {
+		log.Fatalf("Invalid config: %v", err)
+	}
 	loginPolicy = service.NewLoginPolicy(cfg.Auth.AllowedEmailDomains, cfg.Auth.AllowedEmails)
 	if orgAccess, err = newOrgPolicy(cfg.Auth); err != nil {
 		log.Fatalf("Invalid config: %v", err)
 	}
+	logger.Info("Access policy loaded",
+		slog.Bool("login_allowlist", loginPolicy.Enabled()),
+		slog.Int("allowed_email_domains", len(cfg.Auth.AllowedEmailDomains)),
+		slog.Int("allowed_emails", len(cfg.Auth.AllowedEmails)),
+		slog.Bool("shared_org", orgAccess.enabled()),
+		slog.Int("owner_emails", len(orgAccess.owners)),
+	)
 
 	logger.Info("Starting Control Plane API",
 		slog.String("environment", cfg.Server.Environment),
@@ -247,7 +257,10 @@ func main() {
 	deploymentHandler := bootstraphandler.NewDeploymentHandler(bootstrapRepo, unifiedOrch, orgSvc)
 	// POPKins uses same session mechanism as main dashboard (cookie + DB lookup)
 	// Pass the unified orchestrator so deployments are started automatically
-	popkinsHandler := popkins.NewHandler(authSvc, orgSvc, keySvc, bootstrapRepo, unifiedOrch, sessionRepo, userRepo, loginPolicy)
+	resolveOrg := func(ctx context.Context, user *models.User) (*models.Organization, error) {
+		return ensureUserHasOrg(ctx, user, orgRepo)
+	}
+	popkinsHandler := popkins.NewHandler(authSvc, orgSvc, keySvc, bootstrapRepo, unifiedOrch, sessionRepo, userRepo, loginPolicy, resolveOrg)
 	logger.Info("POPKins handler initialized")
 
 	// Process any pending deployments from previous server runs
@@ -585,7 +598,8 @@ func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *c
 				slog.String("provider", provider),
 				slog.String("error", err.Error()),
 			)
-			message := "Authentication failed: " + err.Error()
+			// Provider and database errors are logged above; none of their text belongs in a URL.
+			message := "Authentication failed, please try again"
 			if errors.Is(err, service.ErrEmailNotAllowed) {
 				message = notAllowedLoginError
 			}
@@ -756,7 +770,9 @@ func getAuthenticatedUser(w http.ResponseWriter, r *http.Request, sessionRepo re
 
 	// Re-check the allowlist so removing an address revokes existing sessions on their next request.
 	if !loginPolicy.Allows(user.Email) {
-		_ = sessionRepo.Delete(r.Context(), cookie.Value)
+		if err := sessionRepo.Delete(r.Context(), cookie.Value); err != nil {
+			slog.Warn("Failed to delete revoked session", slog.String("user_id", user.ID.String()), slog.String("error", err.Error()))
+		}
 		http.SetCookie(w, &http.Cookie{
 			Name:   sessionCookieName,
 			Value:  "",
@@ -961,7 +977,7 @@ func keyViewHandler(sessionRepo repository.SessionRepository, userRepo repositor
 
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
@@ -1030,7 +1046,7 @@ func keySignHandler(sessionRepo repository.SessionRepository, userRepo repositor
 
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 		if !requireRole(w, r, orgRepo, org, user, models.RoleOperator) {
@@ -1112,7 +1128,7 @@ func keyDeleteHandler(sessionRepo repository.SessionRepository, userRepo reposit
 
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
@@ -1167,7 +1183,7 @@ func settingsAPIKeysHandler(sessionRepo repository.SessionRepository, userRepo r
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
 			slog.Error("Failed to get/create org for API keys page", slog.String("error", err.Error()))
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
@@ -1415,7 +1431,7 @@ func settingsCertificatesHandler(sessionRepo repository.SessionRepository, userR
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
 			slog.Error("Failed to get/create org for certificates page", slog.String("error", err.Error()))
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
@@ -1672,7 +1688,7 @@ func settingsCertificatesDownloadHandler(sessionRepo repository.SessionRepositor
 
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
@@ -1892,7 +1908,7 @@ func usageHandler(sessionRepo repository.SessionRepository, userRepo repository.
 		// Ensure user has an org
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
@@ -1970,7 +1986,7 @@ func auditHandler(sessionRepo repository.SessionRepository, userRepo repository.
 		// Ensure user has an org
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 

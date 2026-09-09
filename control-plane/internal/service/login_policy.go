@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -33,6 +34,22 @@ func NewLoginPolicy(domains, emails []string) *LoginPolicy {
 		}
 	}
 	return p
+}
+
+// ValidateLoginAllowlist rejects entries that could never match, so a typo fails startup
+// instead of silently locking someone out or leaving login open.
+func ValidateLoginAllowlist(domains, emails []string) error {
+	for _, d := range domains {
+		if d = strings.TrimPrefix(normalizeEmail(d), "@"); strings.ContainsAny(d, "@ ") || (d == "" && len(domains) > 0) {
+			return fmt.Errorf("allowed_email_domains entry %q is not a domain", d)
+		}
+	}
+	for _, e := range emails {
+		if e = normalizeEmail(e); !strings.Contains(e, "@") || strings.ContainsAny(e, " ") {
+			return fmt.Errorf("allowed_emails entry %q is not an email address", e)
+		}
+	}
+	return nil
 }
 
 // Enabled reports whether the policy restricts logins at all. A nil policy restricts nothing.

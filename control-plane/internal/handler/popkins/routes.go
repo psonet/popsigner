@@ -95,7 +95,12 @@ func (h *Handler) RequireAuth(next http.Handler) http.Handler {
 
 		// Load user from database
 		user, err := h.userRepo.GetByID(r.Context(), session.UserID)
-		if err != nil || user == nil || !h.loginPolicy.Allows(user.Email) {
+		if err != nil || user == nil {
+			h.handleAuthError(w, r)
+			return
+		}
+		if !h.loginPolicy.Allows(user.Email) {
+			h.revokeSession(r.Context(), cookie.Value, user)
 			h.handleAuthError(w, r)
 			return
 		}

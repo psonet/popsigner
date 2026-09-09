@@ -78,3 +78,29 @@ func TestParseGoogleUser_Unverified(t *testing.T) {
 		t.Fatal("unverified Google email must be rejected")
 	}
 }
+
+func TestValidateLoginAllowlist(t *testing.T) {
+	valid := [][2][]string{
+		{nil, nil},
+		{{"a.example", "@b.example"}, nil},
+		{nil, {"guest@c.example", " Root@A.example "}},
+	}
+	for _, v := range valid {
+		if err := ValidateLoginAllowlist(v[0], v[1]); err != nil {
+			t.Errorf("ValidateLoginAllowlist(%v, %v) = %v, want nil", v[0], v[1], err)
+		}
+	}
+	invalid := [][2][]string{
+		{{"user@a.example"}, nil},
+		{{""}, nil},
+		{{"a example"}, nil},
+		{nil, {"user.a.example"}},
+		{nil, {""}},
+		{nil, {"user @a.example"}},
+	}
+	for _, v := range invalid {
+		if err := ValidateLoginAllowlist(v[0], v[1]); err == nil {
+			t.Errorf("ValidateLoginAllowlist(%v, %v) = nil, want error", v[0], v[1])
+		}
+	}
+}

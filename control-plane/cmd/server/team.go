@@ -56,14 +56,13 @@ func settingsTeamHandler(sessionRepo repository.SessionRepository, userRepo repo
 
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
 		members, err := orgSvc.ListMembers(r.Context(), org.ID, user.ID)
 		if err != nil {
-			slog.Error("Failed to list team members", slog.String("org_id", org.ID.String()), slog.String("error", err.Error()))
-			http.Error(w, "Failed to list team members", http.StatusInternalServerError)
+			writeOrgServiceError(w, "list team members", err)
 			return
 		}
 
@@ -110,7 +109,7 @@ func settingsTeamEditModalHandler(sessionRepo repository.SessionRepository, user
 
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
@@ -119,7 +118,7 @@ func settingsTeamEditModalHandler(sessionRepo repository.SessionRepository, user
 
 		members, err := orgSvc.ListMembers(r.Context(), org.ID, user.ID)
 		if err != nil {
-			http.Error(w, "Failed to list team members", http.StatusInternalServerError)
+			writeOrgServiceError(w, "list team members", err)
 			return
 		}
 		for _, m := range members {
@@ -152,14 +151,14 @@ func settingsTeamUpdateRoleHandler(sessionRepo repository.SessionRepository, use
 			return
 		}
 		role := models.Role(r.FormValue("role"))
-		if !models.ValidRole(role) {
+		if !models.ValidRole(role) || role == models.RoleOwner {
 			http.Error(w, "Invalid role", http.StatusBadRequest)
 			return
 		}
 
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
@@ -195,13 +194,17 @@ func settingsTeamRemoveHandler(sessionRepo repository.SessionRepository, userRep
 
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
 		if err := orgSvc.RemoveMember(r.Context(), org.ID, memberID, user.ID); err != nil {
 			writeOrgServiceError(w, "remove member", err)
 			return
+		}
+		// Removal takes effect now rather than at the member's next request.
+		if err := sessionRepo.DeleteAllForUser(r.Context(), memberID); err != nil {
+			slog.Warn("Failed to end removed member's sessions", slog.String("member_id", memberID.String()), slog.String("error", err.Error()))
 		}
 
 		slog.Info("Team member removed",

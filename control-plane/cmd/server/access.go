@@ -110,6 +110,15 @@ func (p orgPolicy) roleFor(email string) models.Role {
 	return p.defaultRole
 }
 
+// writeOrgError answers an ensureUserHasOrg failure: 403 for a non-member, 500 otherwise.
+func writeOrgError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errNotMember) {
+		http.Error(w, "You are not a member of this organization", http.StatusForbidden)
+		return
+	}
+	http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+}
+
 func roleAllows(member *models.OrgMember, required models.Role) bool {
 	return member != nil && models.RoleLevel(member.Role) >= models.RoleLevel(required)
 }
@@ -140,13 +149,16 @@ func joinSharedOrg(ctx context.Context, user *models.User, orgRepo repository.Or
 		if createErr := orgRepo.Create(ctx, org, user.ID); createErr != nil {
 			// Lost the race with another first login: use the winner's organization.
 			if org, err = orgRepo.GetBySlug(ctx, orgAccess.sharedOrg); err != nil || org == nil {
-				return nil, fmt.Errorf("create shared organization: %w", createErr)
+				return nil, fmt.Errorf("create shared organization: %w (re-read: %v)", createErr, err)
 			}
-		} else if err := orgRepo.UpdatePlan(ctx, org.ID, models.PlanEnterprise); err != nil {
-			return nil, err
-		} else {
-			org.Plan = models.PlanEnterprise
 		}
+	}
+	// Plan limits would otherwise cap keys and members for the whole deployment.
+	if org.Plan != models.PlanEnterprise {
+		if err := orgRepo.UpdatePlan(ctx, org.ID, models.PlanEnterprise); err != nil {
+			return nil, err
+		}
+		org.Plan = models.PlanEnterprise
 	}
 
 	want := orgAccess.roleFor(user.Email)

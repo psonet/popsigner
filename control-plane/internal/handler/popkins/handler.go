@@ -54,9 +54,14 @@ type Handler struct {
 	sessionRepo  mainrepo.SessionRepository
 	userRepo     mainrepo.UserRepository
 	loginPolicy  *service.LoginPolicy
+	resolveOrg   OrgResolver
 }
 
-// NewHandler creates a new POPKins handler.
+// OrgResolver returns the organization a signed-in user acts in, or an error when they have none.
+type OrgResolver func(ctx context.Context, user *models.User) (*models.Organization, error)
+
+// NewHandler creates a new POPKins handler. loginPolicy may be nil (no login restriction);
+// resolveOrg may be nil, in which case the user's oldest organization is used.
 func NewHandler(
 	authService service.AuthService,
 	orgService service.OrgService,
@@ -66,6 +71,7 @@ func NewHandler(
 	sessionRepo mainrepo.SessionRepository,
 	userRepo mainrepo.UserRepository,
 	loginPolicy *service.LoginPolicy,
+	resolveOrg OrgResolver,
 ) *Handler {
 	return &Handler{
 		authService:  authService,
@@ -76,6 +82,7 @@ func NewHandler(
 		sessionRepo:  sessionRepo,
 		userRepo:     userRepo,
 		loginPolicy:  loginPolicy,
+		resolveOrg:   resolveOrg,
 	}
 }
 
@@ -1585,7 +1592,16 @@ func (h *Handler) getUserAndOrg(r *http.Request) (*models.User, *models.Organiza
 		return nil, nil, errors.New("user not found")
 	}
 	if !h.loginPolicy.Allows(user.Email) {
+		h.revokeSession(r.Context(), cookie.Value, user)
 		return nil, nil, errors.New("user is no longer allowed to sign in")
+	}
+
+	if h.resolveOrg != nil {
+		org, err := h.resolveOrg(r.Context(), user)
+		if err != nil || org == nil {
+			return nil, nil, fmt.Errorf("resolve organization: %w", err)
+		}
+		return user, org, nil
 	}
 
 	// Get first org for user
@@ -1600,6 +1616,13 @@ func (h *Handler) getUserAndOrg(r *http.Request) (*models.User, *models.Organiza
 	}
 
 	return user, org, nil
+}
+
+// revokeSession ends a session whose user is no longer allowed to sign in.
+func (h *Handler) revokeSession(ctx context.Context, sessionID string, user *models.User) {
+	if err := h.sessionRepo.Delete(ctx, sessionID); err != nil {
+		slog.Warn("failed to delete revoked session", "user_id", user.ID, "error", err)
+	}
 }
 
 // handleAuthError handles authentication errors by redirecting to login.

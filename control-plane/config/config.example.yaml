@@ -60,7 +60,8 @@ auth:
   oauth_google_id: ""
   oauth_google_secret: ""
 
-  # Domain attribute on auth cookies; "" means host-only cookies
+  # Domain attribute on auth cookies; "" means host-only cookies. Must match the
+  # host you serve from, or every login ends in "Login expired".
   cookie_domain: ".popsigner.com"
 
   # Login allowlist. Both empty = anyone who can complete OAuth may sign in.
@@ -68,9 +69,12 @@ auth:
   allowed_emails: []          # e.g. ["contractor@partner.example"]
 
   # Shared organization. Set a slug to make every allowed login a member of one
-  # organization instead of creating a personal one per user.
-  shared_org: ""              # e.g. "platform"
-  owner_emails: []            # members listed here are owners; everyone else joins as default_role
+  # organization instead of creating a personal one per user. The first allowed
+  # login creates it on the enterprise plan (no key or member limits). Owners come
+  # only from owner_emails, which must name at least one address; until one of them
+  # signs in nobody can manage roles. Other roles are changed on the Team page.
+  shared_org: ""              # e.g. "platform" (lowercase letters, digits, dashes)
+  owner_emails: []            # required when shared_org is set
   default_role: "operator"    # admin | operator | viewer
 
 # NOTE: Billing (Stripe) integration is planned for a future release.

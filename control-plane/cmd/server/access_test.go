@@ -3,13 +3,17 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/Bidon15/popsigner/control-plane/internal/config"
 	"github.com/Bidon15/popsigner/control-plane/internal/models"
+	apierrors "github.com/Bidon15/popsigner/control-plane/internal/pkg/errors"
 	"github.com/Bidon15/popsigner/control-plane/internal/repository"
 )
 
@@ -148,6 +152,7 @@ type fakeOrgRepo struct {
 	org       *models.Organization
 	member    *models.OrgMember
 	createErr error
+	memberErr error
 	plan      models.Plan
 	added     *models.Role
 	updated   *models.Role
@@ -177,6 +182,9 @@ func (f *fakeOrgRepo) UpdatePlan(_ context.Context, _ uuid.UUID, plan models.Pla
 }
 
 func (f *fakeOrgRepo) GetMember(_ context.Context, _ uuid.UUID, userID uuid.UUID) (*models.OrgMember, error) {
+	if f.memberErr != nil {
+		return nil, f.memberErr
+	}
 	if f.member != nil && f.member.UserID == userID {
 		return f.member, nil
 	}
@@ -288,5 +296,90 @@ func TestRoleAllows(t *testing.T) {
 				t.Fatalf("roleAllows = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRequireRole(t *testing.T) {
+	org := &models.Organization{ID: uuid.New()}
+	user := &models.User{ID: uuid.New()}
+	tests := []struct {
+		name       string
+		repo       *fakeOrgRepo
+		required   models.Role
+		want       bool
+		wantStatus int
+	}{
+		{"sufficient rank passes without writing", &fakeOrgRepo{member: &models.OrgMember{UserID: user.ID, Role: models.RoleAdmin}}, models.RoleOperator, true, http.StatusOK},
+		{"insufficient rank is forbidden", &fakeOrgRepo{member: &models.OrgMember{UserID: user.ID, Role: models.RoleViewer}}, models.RoleOperator, false, http.StatusForbidden},
+		{"non-member is forbidden", &fakeOrgRepo{}, models.RoleViewer, false, http.StatusForbidden},
+		{"repository failure is a server error", &fakeOrgRepo{memberErr: errors.New("db down")}, models.RoleViewer, false, http.StatusInternalServerError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodGet, "/keys", nil)
+			if got := requireRole(w, r, tt.repo, org, user, tt.required); got != tt.want {
+				t.Fatalf("requireRole = %v, want %v", got, tt.want)
+			}
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", w.Code, tt.wantStatus)
+			}
+			if tt.want && w.Body.Len() != 0 {
+				t.Fatalf("passing gate must not write a body, got %q", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestWriteOrgError(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeOrgError(w, errNotMember)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-member status = %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	writeOrgError(w, errors.New("connection refused"))
+	if w.Code != http.StatusInternalServerError || strings.Contains(w.Body.String(), "connection refused") {
+		t.Fatalf("other errors must be a generic 500, got %d %q", w.Code, w.Body.String())
+	}
+}
+
+func TestWriteOrgServiceError(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeOrgServiceError(w, "remove member", apierrors.ErrForbidden.WithMessage("Cannot remove the organization owner"))
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "Cannot remove the organization owner") {
+		t.Fatalf("typed error must keep its status and message, got %d %q", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	writeOrgServiceError(w, "remove member", apierrors.NewNotFoundError("Member"))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("not found status = %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	writeOrgServiceError(w, "remove member", errors.New("ERROR: relation missing (SQLSTATE 42P01)"))
+	if w.Code != http.StatusInternalServerError || strings.Contains(w.Body.String(), "SQLSTATE") {
+		t.Fatalf("opaque errors must be a generic 500, got %d %q", w.Code, w.Body.String())
+	}
+}
+
+func TestTeamMemberDisplay(t *testing.T) {
+	me := uuid.New()
+	name, avatar := "Ada", "https://img.example/a.png"
+	joined := time.Date(2026, time.March, 4, 0, 0, 0, 0, time.UTC)
+
+	full := teamMemberDisplay(&models.OrgMember{UserID: me, Role: models.RoleAdmin, JoinedAt: joined,
+		User: &models.User{Email: "ada@a.example", Name: &name, AvatarURL: &avatar}}, me)
+	if full.Name != "Ada" || full.Email != "ada@a.example" || full.AvatarURL != avatar || !full.IsCurrentUser || full.JoinedAt != "Mar 4, 2026" || full.Role != models.RoleAdmin {
+		t.Fatalf("unexpected display: %+v", full)
+	}
+
+	bare := teamMemberDisplay(&models.OrgMember{UserID: uuid.New(), Role: models.RoleViewer, JoinedAt: joined, User: &models.User{Email: "x@a.example"}}, me)
+	if bare.Name != "" || bare.AvatarURL != "" || bare.IsCurrentUser || bare.Email != "x@a.example" {
+		t.Fatalf("nil name/avatar must render empty: %+v", bare)
+	}
+
+	noUser := teamMemberDisplay(&models.OrgMember{UserID: uuid.New(), Role: models.RoleViewer, JoinedAt: joined}, me)
+	if noUser.Email != "" || noUser.Name != "" {
+		t.Fatalf("missing user must not panic and renders empty: %+v", noUser)
 	}
 }
