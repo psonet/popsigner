@@ -335,7 +335,10 @@ func main() {
 	r.Get("/audit", auditHandler(sessionRepo, userRepo, orgRepo, auditRepo))
 
 	// Team management
-	r.Get("/settings/team", settingsTeamHandler(sessionRepo, userRepo, orgRepo))
+	r.Get("/settings/team", settingsTeamHandler(sessionRepo, userRepo, orgRepo, orgSvc))
+	r.Get("/settings/team/{id}/edit", settingsTeamEditModalHandler(sessionRepo, userRepo, orgRepo, orgSvc))
+	r.Patch("/settings/team/{id}", settingsTeamUpdateRoleHandler(sessionRepo, userRepo, orgRepo, orgSvc))
+	r.Delete("/settings/team/{id}", settingsTeamRemoveHandler(sessionRepo, userRepo, orgRepo, orgSvc))
 
 	// POPKins - Chain deployment platform (separate product)
 	// In production: popkins.popsigner.com
@@ -2192,69 +2195,4 @@ func createHostRouter(dashboardRouter http.Handler, popkinsRouter http.Handler, 
 			dashboardRouter.ServeHTTP(w, r)
 		}
 	})
-}
-
-// settingsTeamHandler serves the team settings page.
-func settingsTeamHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, orgRepo repository.OrgRepository) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		user := getAuthenticatedUser(w, r, sessionRepo, userRepo)
-		if user == nil {
-			return
-		}
-
-		// Ensure user has an org
-		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
-		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
-			return
-		}
-
-		dashData := buildDashboardData(user, "/settings/team")
-		dashData.OrgName = org.Name
-		dashData.OrgPlan = string(org.Plan)
-
-		// Get plan limits
-		limits := models.GetPlanLimits(org.Plan)
-
-		// Get current user as the only member (simplified - full team management requires OrgService)
-		userName := ""
-		if user.Name != nil {
-			userName = *user.Name
-		}
-		avatarURL := ""
-		if user.AvatarURL != nil {
-			avatarURL = *user.AvatarURL
-		}
-
-		members := []*pages.TeamMemberDisplay{
-			{
-				ID:            user.ID,
-				Name:          userName,
-				Email:         user.Email,
-				AvatarURL:     avatarURL,
-				Role:          models.RoleOwner,
-				JoinedAt:      user.CreatedAt.Format("Jan 2, 2006"),
-				IsCurrentUser: true,
-			},
-		}
-
-		data := pages.TeamPageData{
-			DashboardData: layouts.DashboardData{
-				UserName:   dashData.UserName,
-				UserEmail:  dashData.UserEmail,
-				AvatarURL:  dashData.AvatarURL,
-				OrgName:    dashData.OrgName,
-				OrgPlan:    dashData.OrgPlan,
-				ActivePath: "/settings/team",
-			},
-			Members:     members,
-			Invitations: nil,
-			CurrentRole: models.RoleOwner,
-			MemberLimit: limits.TeamMembers,
-			MemberCount: 1,
-		}
-
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		pages.SettingsTeamPage(data).Render(r.Context(), w)
-	}
 }
