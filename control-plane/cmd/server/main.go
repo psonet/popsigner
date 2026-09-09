@@ -69,6 +69,9 @@ func main() {
 	}
 	cookieDomain = cfg.Auth.CookieDomain
 	loginPolicy = service.NewLoginPolicy(cfg.Auth.AllowedEmailDomains, cfg.Auth.AllowedEmails)
+	if orgAccess, err = newOrgPolicy(cfg.Auth); err != nil {
+		log.Fatalf("Invalid config: %v", err)
+	}
 
 	logger.Info("Starting Control Plane API",
 		slog.String("environment", cfg.Server.Environment),
@@ -685,16 +688,14 @@ func dashboardHandler(sessionRepo repository.SessionRepository, userRepo reposit
 		keyCount := 0
 		signatureLimit := 1000 // Default free tier
 		var orgID uuid.UUID
-		orgs, err := orgRepo.ListUserOrgs(r.Context(), user.ID)
-		if err == nil && len(orgs) > 0 {
-			orgID = orgs[0].ID
-			// Get keys for the first org
+		if org, err := ensureUserHasOrg(r.Context(), user, orgRepo); err == nil && org != nil {
+			orgID = org.ID
 			keys, err := keyRepo.ListByOrg(r.Context(), orgID)
 			if err == nil {
 				keyCount = len(keys)
 			}
 			// Get plan limits
-			limits := models.PlanLimitsMap[orgs[0].Plan]
+			limits := models.PlanLimitsMap[org.Plan]
 			signatureLimit = int(limits.SignaturesPerMonth)
 		}
 
@@ -1781,6 +1782,10 @@ func bech32Polymod(values []byte) int {
 // ensureUserHasOrg ensures the user has at least one organization.
 // If the user has no orgs, it creates a default "Personal" org.
 func ensureUserHasOrg(ctx context.Context, user *models.User, orgRepo repository.OrgRepository) (*models.Organization, error) {
+	if orgAccess.enabled() {
+		return resolveSharedOrg(ctx, user, orgRepo)
+	}
+
 	// Check if user already has orgs
 	orgs, err := orgRepo.ListUserOrgs(ctx, user.ID)
 	if err != nil {
