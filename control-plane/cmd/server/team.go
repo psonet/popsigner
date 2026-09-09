@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -8,10 +9,23 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Bidon15/popsigner/control-plane/internal/models"
+	apierrors "github.com/Bidon15/popsigner/control-plane/internal/pkg/errors"
 	"github.com/Bidon15/popsigner/control-plane/internal/repository"
 	"github.com/Bidon15/popsigner/control-plane/internal/service"
 	"github.com/Bidon15/popsigner/control-plane/templates/pages"
 )
+
+// writeOrgServiceError maps the org service's typed errors to their status; anything else is a 500
+// with a generic body so database errors never reach the browser.
+func writeOrgServiceError(w http.ResponseWriter, action string, err error) {
+	var apiErr *apierrors.APIError
+	if errors.As(err, &apiErr) {
+		http.Error(w, apiErr.Message, apiErr.StatusCode)
+		return
+	}
+	slog.Error("Failed to "+action, slog.String("error", err.Error()))
+	http.Error(w, "Failed to "+action, http.StatusInternalServerError)
+}
 
 func teamMemberDisplay(m *models.OrgMember, currentUserID uuid.UUID) *pages.TeamMemberDisplay {
 	d := &pages.TeamMemberDisplay{
@@ -150,7 +164,7 @@ func settingsTeamUpdateRoleHandler(sessionRepo repository.SessionRepository, use
 		}
 
 		if err := orgSvc.UpdateMemberRole(r.Context(), org.ID, memberID, role, user.ID); err != nil {
-			http.Error(w, err.Error(), http.StatusForbidden)
+			writeOrgServiceError(w, "update member role", err)
 			return
 		}
 
@@ -186,7 +200,7 @@ func settingsTeamRemoveHandler(sessionRepo repository.SessionRepository, userRep
 		}
 
 		if err := orgSvc.RemoveMember(r.Context(), org.ID, memberID, user.ID); err != nil {
-			http.Error(w, err.Error(), http.StatusForbidden)
+			writeOrgServiceError(w, "remove member", err)
 			return
 		}
 

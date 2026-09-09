@@ -247,7 +247,7 @@ func main() {
 	deploymentHandler := bootstraphandler.NewDeploymentHandler(bootstrapRepo, unifiedOrch, orgSvc)
 	// POPKins uses same session mechanism as main dashboard (cookie + DB lookup)
 	// Pass the unified orchestrator so deployments are started automatically
-	popkinsHandler := popkins.NewHandler(authSvc, orgSvc, keySvc, bootstrapRepo, unifiedOrch, sessionRepo, userRepo)
+	popkinsHandler := popkins.NewHandler(authSvc, orgSvc, keySvc, bootstrapRepo, unifiedOrch, sessionRepo, userRepo, loginPolicy)
 	logger.Info("POPKins handler initialized")
 
 	// Process any pending deployments from previous server runs
@@ -348,9 +348,9 @@ func main() {
 
 	// OAuth routes - using the service
 	r.Get("/auth/github", oauthRedirectHandler(oauthSvc, "github"))
-	r.Get("/auth/github/callback", oauthCallbackHandler(oauthSvc, "github", cfg))
+	r.Get("/auth/github/callback", oauthCallbackHandler(oauthSvc, "github", cfg, orgRepo))
 	r.Get("/auth/google", oauthRedirectHandler(oauthSvc, "google"))
-	r.Get("/auth/google/callback", oauthCallbackHandler(oauthSvc, "google", cfg))
+	r.Get("/auth/google/callback", oauthCallbackHandler(oauthSvc, "google", cfg, orgRepo))
 
 	// API v1 routes
 	r.Route("/v1", func(r chi.Router) {
@@ -522,7 +522,8 @@ func oauthRedirectHandler(oauthSvc service.OAuthService, provider string) http.H
 			Name:     "oauth_state",
 			Value:    state,
 			Path:     "/",
-			MaxAge:   300, // 5 minutes
+			Domain:   cookieDomain, // The callback lands on the main host even for POPKins logins
+			MaxAge:   300,          // 5 minutes
 			HttpOnly: true,
 			Secure:   true,
 			SameSite: http.SameSiteLaxMode,
@@ -561,7 +562,7 @@ func oauthRedirectHandler(oauthSvc service.OAuthService, provider string) http.H
 }
 
 // oauthCallbackHandler handles the OAuth callback from the provider.
-func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *config.Config) http.HandlerFunc {
+func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *config.Config, orgRepo repository.OrgRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")
 		if code == "" {
@@ -598,6 +599,14 @@ func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *c
 			slog.String("email", user.Email),
 		)
 
+		if orgAccess.enabled() {
+			if _, err := joinSharedOrg(r.Context(), user, orgRepo); err != nil {
+				slog.Error("Failed to join shared organization", slog.String("user_id", user.ID.String()), slog.String("error", err.Error()))
+				http.Redirect(w, r, "/login?error="+url.QueryEscape("Could not join the organization, please try again"), http.StatusFound)
+				return
+			}
+		}
+
 		// Set the session cookie (domain shared across all subdomains)
 		http.SetCookie(w, &http.Cookie{
 			Name:     sessionCookieName,
@@ -615,6 +624,7 @@ func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *c
 			Name:   "oauth_state",
 			Value:  "",
 			Path:   "/",
+			Domain: cookieDomain,
 			MaxAge: -1,
 		})
 
@@ -644,46 +654,8 @@ func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *c
 // dashboardHandler serves the dashboard page for authenticated users.
 func dashboardHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, orgRepo repository.OrgRepository, keyRepo repository.KeyRepository, auditRepo repository.AuditRepository, usageRepo repository.UsageRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get session cookie
-		cookie, err := r.Cookie(sessionCookieName)
-		if err != nil {
-			http.Redirect(w, r, "/login", http.StatusFound)
-			return
-		}
-
-		// Validate session
-		session, err := sessionRepo.Get(r.Context(), cookie.Value)
-		if err != nil || session == nil {
-			// Invalid or expired session
-			http.SetCookie(w, &http.Cookie{
-				Name:   sessionCookieName,
-				Value:  "",
-				Path:   "/",
-				Domain: cookieDomain,
-				MaxAge: -1,
-			})
-			http.Redirect(w, r, "/login", http.StatusFound)
-			return
-		}
-
-		// Check if session is expired
-		if session.ExpiresAt.Before(time.Now()) {
-			_ = sessionRepo.Delete(r.Context(), cookie.Value)
-			http.SetCookie(w, &http.Cookie{
-				Name:   sessionCookieName,
-				Value:  "",
-				Path:   "/",
-				Domain: cookieDomain,
-				MaxAge: -1,
-			})
-			http.Redirect(w, r, "/login?error="+url.QueryEscape("Session expired"), http.StatusFound)
-			return
-		}
-
-		// Get user info
-		user, err := userRepo.GetByID(r.Context(), session.UserID)
-		if err != nil || user == nil {
-			http.Redirect(w, r, "/login", http.StatusFound)
+		user := getAuthenticatedUser(w, r, sessionRepo, userRepo)
+		if user == nil {
 			return
 		}
 
@@ -1821,7 +1793,7 @@ func bech32Polymod(values []byte) int {
 // If the user has no orgs, it creates a default "Personal" org.
 func ensureUserHasOrg(ctx context.Context, user *models.User, orgRepo repository.OrgRepository) (*models.Organization, error) {
 	if orgAccess.enabled() {
-		return resolveSharedOrg(ctx, user, orgRepo)
+		return sharedOrgFor(ctx, user, orgRepo)
 	}
 
 	// Check if user already has orgs

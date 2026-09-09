@@ -94,7 +94,7 @@ func TestNewOrgPolicy(t *testing.T) {
 		t.Fatalf("empty shared_org must disable the policy: %v %+v", err, p)
 	}
 
-	p, err = newOrgPolicy(config.AuthConfig{SharedOrg: " platform ", OwnerEmails: []string{" Root@A.example "}, DefaultRole: "Viewer"})
+	p, err = newOrgPolicy(config.AuthConfig{SharedOrg: " platform-eu ", OwnerEmails: []string{" Root@A.example "}, DefaultRole: "Viewer"})
 	if err != nil || !p.enabled() {
 		t.Fatalf("valid policy rejected: %v", err)
 	}
@@ -103,13 +103,46 @@ func TestNewOrgPolicy(t *testing.T) {
 	}
 
 	for _, role := range []string{"", "owner", "root"} {
-		if _, err := newOrgPolicy(config.AuthConfig{SharedOrg: "platform", DefaultRole: role}); err == nil {
+		if _, err := newOrgPolicy(config.AuthConfig{SharedOrg: "platform", OwnerEmails: []string{"root@a.example"}, DefaultRole: role}); err == nil {
 			t.Fatalf("default_role %q must be rejected", role)
+		}
+	}
+	if _, err := newOrgPolicy(config.AuthConfig{SharedOrg: "platform", OwnerEmails: []string{" "}, DefaultRole: "operator"}); err == nil {
+		t.Fatal("shared_org without an owner must be rejected")
+	}
+	for _, slug := range []string{"Platform", "platform team", "platform_(eu)", "-platform", "platform--eu", strings.Repeat("a", 101)} {
+		if _, err := newOrgPolicy(config.AuthConfig{SharedOrg: slug, OwnerEmails: []string{"root@a.example"}, DefaultRole: "operator"}); err == nil {
+			t.Fatalf("shared_org %q must be rejected", slug)
 		}
 	}
 }
 
-// fakeOrgRepo stubs only what resolveSharedOrg touches; any other call panics on the nil embed.
+func TestSharedOrgFor(t *testing.T) {
+	defer func(old orgPolicy) { orgAccess = old }(orgAccess)
+	orgAccess = orgPolicy{sharedOrg: "platform", owners: map[string]struct{}{}, defaultRole: models.RoleOperator}
+	ctx := context.Background()
+	existing := &models.Organization{ID: uuid.New(), Slug: "platform"}
+	user := &models.User{ID: uuid.New(), Email: "user@a.example"}
+
+	repo := &fakeOrgRepo{org: existing, member: &models.OrgMember{UserID: user.ID, Role: models.RoleViewer}}
+	org, err := joinLess(sharedOrgFor(ctx, user, repo))
+	if err != nil || org != existing || repo.added != nil || repo.updated != nil {
+		t.Fatalf("member lookup: org=%v err=%v added=%v updated=%v", org, err, repo.added, repo.updated)
+	}
+
+	repo = &fakeOrgRepo{org: existing}
+	if _, err := sharedOrgFor(ctx, user, repo); !errors.Is(err, errNotMember) || repo.added != nil {
+		t.Fatalf("removed member must not be re-added: err=%v added=%v", err, repo.added)
+	}
+
+	if _, err := sharedOrgFor(ctx, user, &fakeOrgRepo{}); !errors.Is(err, errNotMember) {
+		t.Fatalf("missing org must not be created on read: %v", err)
+	}
+}
+
+func joinLess(org *models.Organization, err error) (*models.Organization, error) { return org, err }
+
+// fakeOrgRepo stubs only what joinSharedOrg touches; any other call panics on the nil embed.
 type fakeOrgRepo struct {
 	repository.OrgRepository
 	org       *models.Organization
@@ -169,7 +202,7 @@ func TestResolveSharedOrg(t *testing.T) {
 	t.Run("first login creates the org and takes the configured role", func(t *testing.T) {
 		repo := &fakeOrgRepo{}
 		user := &models.User{ID: uuid.New(), Email: "user@a.example"}
-		org, err := resolveSharedOrg(ctx, user, repo)
+		org, err := joinSharedOrg(ctx, user, repo)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -184,7 +217,7 @@ func TestResolveSharedOrg(t *testing.T) {
 	t.Run("lost creation race falls back to the winner", func(t *testing.T) {
 		repo := &fakeOrgRepo{createErr: errors.New("duplicate slug")}
 		user := &models.User{ID: uuid.New(), Email: "user@a.example"}
-		if _, err := resolveSharedOrg(ctx, user, repo); err == nil {
+		if _, err := joinSharedOrg(ctx, user, repo); err == nil {
 			t.Fatal("no winner to fall back to must error")
 		}
 	})
@@ -192,7 +225,7 @@ func TestResolveSharedOrg(t *testing.T) {
 	t.Run("new member joins with default role", func(t *testing.T) {
 		repo := &fakeOrgRepo{org: existing}
 		user := &models.User{ID: uuid.New(), Email: "user@a.example"}
-		if _, err := resolveSharedOrg(ctx, user, repo); err != nil {
+		if _, err := joinSharedOrg(ctx, user, repo); err != nil {
 			t.Fatal(err)
 		}
 		if repo.added == nil || *repo.added != models.RoleOperator || repo.updated != nil {
@@ -203,7 +236,7 @@ func TestResolveSharedOrg(t *testing.T) {
 	t.Run("configured owner is promoted", func(t *testing.T) {
 		user := &models.User{ID: uuid.New(), Email: "Root@a.example"}
 		repo := &fakeOrgRepo{org: existing, member: &models.OrgMember{UserID: user.ID, Role: models.RoleViewer}}
-		if _, err := resolveSharedOrg(ctx, user, repo); err != nil {
+		if _, err := joinSharedOrg(ctx, user, repo); err != nil {
 			t.Fatal(err)
 		}
 		if repo.updated == nil || *repo.updated != models.RoleOwner {
@@ -214,7 +247,7 @@ func TestResolveSharedOrg(t *testing.T) {
 	t.Run("owner dropped from config is demoted", func(t *testing.T) {
 		user := &models.User{ID: uuid.New(), Email: "former@a.example"}
 		repo := &fakeOrgRepo{org: existing, member: &models.OrgMember{UserID: user.ID, Role: models.RoleOwner}}
-		if _, err := resolveSharedOrg(ctx, user, repo); err != nil {
+		if _, err := joinSharedOrg(ctx, user, repo); err != nil {
 			t.Fatal(err)
 		}
 		if repo.updated == nil || *repo.updated != models.RoleOperator {
@@ -225,7 +258,7 @@ func TestResolveSharedOrg(t *testing.T) {
 	t.Run("UI-managed role is left alone", func(t *testing.T) {
 		user := &models.User{ID: uuid.New(), Email: "user@a.example"}
 		repo := &fakeOrgRepo{org: existing, member: &models.OrgMember{UserID: user.ID, Role: models.RoleAdmin}}
-		if _, err := resolveSharedOrg(ctx, user, repo); err != nil {
+		if _, err := joinSharedOrg(ctx, user, repo); err != nil {
 			t.Fatal(err)
 		}
 		if repo.added != nil || repo.updated != nil {

@@ -35,9 +35,9 @@ func NewLoginPolicy(domains, emails []string) *LoginPolicy {
 	return p
 }
 
-// Enabled reports whether the policy restricts logins at all.
+// Enabled reports whether the policy restricts logins at all. A nil policy restricts nothing.
 func (p *LoginPolicy) Enabled() bool {
-	return len(p.domains)+len(p.emails) > 0
+	return p != nil && len(p.domains)+len(p.emails) > 0
 }
 
 // Allows reports whether email may sign in under this policy.

@@ -36,6 +36,10 @@ func TestLoginPolicy_Allows(t *testing.T) {
 }
 
 func TestLoginPolicy_Enabled(t *testing.T) {
+	var nilPolicy *LoginPolicy
+	if nilPolicy.Enabled() || !nilPolicy.Allows("anyone@evil.example") {
+		t.Fatal("nil policy must allow everyone")
+	}
 	if NewLoginPolicy(nil, nil).Enabled() {
 		t.Fatal("empty policy must not be enabled")
 	}

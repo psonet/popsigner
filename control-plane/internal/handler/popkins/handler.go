@@ -53,6 +53,7 @@ type Handler struct {
 	orchestrator Orchestrator
 	sessionRepo  mainrepo.SessionRepository
 	userRepo     mainrepo.UserRepository
+	loginPolicy  *service.LoginPolicy
 }
 
 // NewHandler creates a new POPKins handler.
@@ -64,6 +65,7 @@ func NewHandler(
 	orchestrator Orchestrator,
 	sessionRepo mainrepo.SessionRepository,
 	userRepo mainrepo.UserRepository,
+	loginPolicy *service.LoginPolicy,
 ) *Handler {
 	return &Handler{
 		authService:  authService,
@@ -73,6 +75,7 @@ func NewHandler(
 		orchestrator: orchestrator,
 		sessionRepo:  sessionRepo,
 		userRepo:     userRepo,
+		loginPolicy:  loginPolicy,
 	}
 }
 
@@ -291,7 +294,10 @@ func (h *Handler) DeploymentsCreate(w http.ResponseWriter, r *http.Request) {
 		h.handleAuthError(w, r)
 		return
 	}
-	_ = user // user context available for audit logging
+	if err := h.orgService.CheckAccess(r.Context(), org.ID, user.ID, models.RoleOperator); err != nil {
+		http.Redirect(w, r, "/deployments/new?step=4&error=Your+role+cannot+create+deployments", http.StatusFound)
+		return
+	}
 
 	if err := r.ParseForm(); err != nil {
 		http.Redirect(w, r, "/deployments/new?step=4&error=Invalid+form+data", http.StatusFound)
@@ -479,6 +485,10 @@ func (h *Handler) CreateKeyInline(w http.ResponseWriter, r *http.Request) {
 	user, org, err := h.getUserAndOrg(r)
 	if err != nil {
 		h.handleAuthError(w, r)
+		return
+	}
+	if err := h.orgService.CheckAccess(r.Context(), org.ID, user.ID, models.RoleOperator); err != nil {
+		http.Redirect(w, r, "/deployments/new?step=3&error=Your+role+cannot+create+keys", http.StatusFound)
 		return
 	}
 
@@ -1573,6 +1583,9 @@ func (h *Handler) getUserAndOrg(r *http.Request) (*models.User, *models.Organiza
 	user, err := h.userRepo.GetByID(r.Context(), session.UserID)
 	if err != nil || user == nil {
 		return nil, nil, errors.New("user not found")
+	}
+	if !h.loginPolicy.Allows(user.Email) {
+		return nil, nil, errors.New("user is no longer allowed to sign in")
 	}
 
 	// Get first org for user
