@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -59,6 +60,20 @@ func (p orgPolicy) roleFor(email string) models.Role {
 		return models.RoleOwner
 	}
 	return p.defaultRole
+}
+
+func roleAllows(member *models.OrgMember, required models.Role) bool {
+	return member != nil && models.RoleLevel(member.Role) >= models.RoleLevel(required)
+}
+
+// requireRole answers 403 and returns false unless user holds at least required in org.
+func requireRole(w http.ResponseWriter, r *http.Request, orgRepo repository.OrgRepository, org *models.Organization, user *models.User, required models.Role) bool {
+	member, err := orgRepo.GetMember(r.Context(), org.ID, user.ID)
+	if err != nil || !roleAllows(member, required) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 // resolveSharedOrg returns the shared organization, creating it on first use, and makes user a

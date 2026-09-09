@@ -308,9 +308,9 @@ func main() {
 	r.Get("/keys", keysListHandler(sessionRepo, userRepo, orgRepo, keyRepo))
 	r.Post("/keys", keysCreateHandler(sessionRepo, userRepo, orgRepo, keySvc))
 	r.Get("/keys/new", keysNewHandler(sessionRepo, userRepo))
-	r.Get("/keys/{id}", keyViewHandler(sessionRepo, userRepo, keyRepo))
+	r.Get("/keys/{id}", keyViewHandler(sessionRepo, userRepo, orgRepo, keySvc))
 	r.Delete("/keys/{id}", keyDeleteHandler(sessionRepo, userRepo, orgRepo, keyRepo, keySvc))
-	r.Post("/keys/{id}/sign-test", keySignHandler(sessionRepo, userRepo, keyRepo, keySvc))
+	r.Post("/keys/{id}/sign-test", keySignHandler(sessionRepo, userRepo, orgRepo, keySvc))
 	r.Get("/settings/api-keys", settingsAPIKeysHandler(sessionRepo, userRepo, orgRepo, apiKeyRepo))
 	r.Get("/settings/api-keys/new", settingsAPIKeysNewHandler(sessionRepo, userRepo, orgRepo))
 	r.Post("/settings/api-keys", settingsAPIKeysCreateHandler(sessionRepo, userRepo, orgRepo, apiKeySvc))
@@ -914,6 +914,9 @@ func keysCreateHandler(sessionRepo repository.SessionRepository, userRepo reposi
 			w.Write([]byte(`<div class="p-4 bg-red-500/20 border border-red-500/50 rounded-xl text-red-400">Failed to get organization</div>`))
 			return
 		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleOperator) {
+			return
+		}
 
 		// Get default namespace
 		namespaces, _ := orgRepo.ListNamespaces(r.Context(), org.ID)
@@ -962,7 +965,7 @@ func keysCreateHandler(sessionRepo repository.SessionRepository, userRepo reposi
 }
 
 // keyViewHandler displays the details of a specific key.
-func keyViewHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, keyRepo repository.KeyRepository) http.HandlerFunc {
+func keyViewHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, orgRepo repository.OrgRepository, keySvc service.KeyService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := getAuthenticatedUser(w, r, sessionRepo, userRepo)
 		if user == nil {
@@ -981,13 +984,21 @@ func keyViewHandler(sessionRepo repository.SessionRepository, userRepo repositor
 			return
 		}
 
-		key, err := keyRepo.GetByID(r.Context(), keyUUID)
+		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
+		if err != nil || org == nil {
+			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			return
+		}
+
+		key, err := keySvc.Get(r.Context(), org.ID, keyUUID)
 		if err != nil || key == nil {
 			http.Error(w, "Key not found", http.StatusNotFound)
 			return
 		}
 
 		dashData := buildDashboardData(user, "/keys")
+		dashData.OrgName = org.Name
+		dashData.OrgPlan = string(org.Plan)
 
 		// Generate Celestia address from the key's hex address
 		celestiaAddr := deriveCelestiaAddress(key.Address)
@@ -1023,7 +1034,7 @@ func keyViewHandler(sessionRepo repository.SessionRepository, userRepo repositor
 }
 
 // keySignHandler handles signing a test message with a key.
-func keySignHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, keyRepo repository.KeyRepository, keySvc service.KeyService) http.HandlerFunc {
+func keySignHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, orgRepo repository.OrgRepository, keySvc service.KeyService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := getAuthenticatedUser(w, r, sessionRepo, userRepo)
 		if user == nil {
@@ -1042,7 +1053,16 @@ func keySignHandler(sessionRepo repository.SessionRepository, userRepo repositor
 			return
 		}
 
-		key, err := keyRepo.GetByID(r.Context(), keyUUID)
+		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
+		if err != nil || org == nil {
+			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleOperator) {
+			return
+		}
+
+		key, err := keySvc.Get(r.Context(), org.ID, keyUUID)
 		if err != nil || key == nil {
 			http.Error(w, "Key not found", http.StatusNotFound)
 			return
@@ -1060,7 +1080,7 @@ func keySignHandler(sessionRepo repository.SessionRepository, userRepo repositor
 		}
 
 		// Sign the message using KeyService (orgID, keyID, data, prehashed)
-		signResp, err := keySvc.Sign(r.Context(), key.OrgID, key.ID, []byte(message), false)
+		signResp, err := keySvc.Sign(r.Context(), org.ID, key.ID, []byte(message), false)
 		if err != nil {
 			slog.Error("Failed to sign message", slog.String("error", err.Error()))
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1115,14 +1135,17 @@ func keyDeleteHandler(sessionRepo repository.SessionRepository, userRepo reposit
 			return
 		}
 
-		key, err := keyRepo.GetByID(r.Context(), keyUUID)
-		if err != nil || key == nil {
-			http.Error(w, "Key not found", http.StatusNotFound)
+		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
+		if err != nil || org == nil {
+			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
-		// Delete the key via KeyService
-		if err := keySvc.Delete(r.Context(), key.OrgID, key.ID); err != nil {
+		// Delete the key via KeyService, which refuses keys outside org
+		if err := keySvc.Delete(r.Context(), org.ID, keyUUID); err != nil {
 			slog.Error("Failed to delete key", slog.String("error", err.Error()))
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Write([]byte(fmt.Sprintf(`<div class="fixed bottom-4 right-4 z-50 flex items-center gap-3 px-4 py-3 bg-black border border-[#FF3333] text-[#FF3333] min-w-[200px] font-mono uppercase" x-data="{ show: true }" x-show="show" x-init="setTimeout(() => { show = false; setTimeout(() => $el.remove(), 200) }, 5000)" x-transition><span>✗</span><span class="text-sm font-medium">%s</span></div>`, err.Error())))
@@ -1134,22 +1157,13 @@ func keyDeleteHandler(sessionRepo repository.SessionRepository, userRepo reposit
 			slog.String("key_id", keyID),
 		)
 
-		// Get org for the keys list
-		org, _ := ensureUserHasOrg(r.Context(), user, orgRepo)
-
 		dashData := buildDashboardData(user, "/keys")
-		if org != nil {
-			dashData.OrgName = org.Name
-			dashData.OrgPlan = string(org.Plan)
-		}
+		dashData.OrgName = org.Name
+		dashData.OrgPlan = string(org.Plan)
 
 		// Fetch updated keys and namespaces
-		var keys []*models.Key
-		var namespaces []*models.Namespace
-		if org != nil {
-			keys, _ = keyRepo.ListByOrg(r.Context(), org.ID)
-			namespaces, _ = orgRepo.ListNamespaces(r.Context(), org.ID)
-		}
+		keys, _ := keyRepo.ListByOrg(r.Context(), org.ID)
+		namespaces, _ := orgRepo.ListNamespaces(r.Context(), org.ID)
 
 		data := pages.KeysPageData{
 			UserName:   dashData.UserName,
@@ -1228,9 +1242,12 @@ func settingsAPIKeysNewHandler(sessionRepo repository.SessionRepository, userRep
 		}
 
 		// Verify user has an org
-		_, err := ensureUserHasOrg(r.Context(), user, orgRepo)
-		if err != nil {
+		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
+		if err != nil || org == nil {
 			http.Error(w, "Session expired or no organization", http.StatusUnauthorized)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
@@ -1252,6 +1269,9 @@ func settingsAPIKeysCreateHandler(sessionRepo repository.SessionRepository, user
 		if err != nil || org == nil {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			pages.APIKeyCreateError("No organization found. Please refresh and try again.").Render(r.Context(), w)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
@@ -1313,6 +1333,9 @@ func settingsAPIKeysDeleteHandler(sessionRepo repository.SessionRepository, user
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
 			http.Error(w, "No organization found", http.StatusBadRequest)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
@@ -1464,9 +1487,12 @@ func settingsCertificatesNewHandler(sessionRepo repository.SessionRepository, us
 		}
 
 		// Verify user has an org
-		_, err := ensureUserHasOrg(r.Context(), user, orgRepo)
-		if err != nil {
+		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
+		if err != nil || org == nil {
 			http.Error(w, "Session expired or no organization", http.StatusUnauthorized)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
@@ -1488,6 +1514,9 @@ func settingsCertificatesCreateHandler(sessionRepo repository.SessionRepository,
 		if err != nil || org == nil {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			pages.CertificateCreateError("No organization found. Please refresh and try again.").Render(r.Context(), w)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
@@ -1555,6 +1584,9 @@ func settingsCertificatesRevokeHandler(sessionRepo repository.SessionRepository,
 			http.Error(w, "No organization found", http.StatusBadRequest)
 			return
 		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
+			return
+		}
 
 		certID := chi.URLParam(r, "id")
 		if certID == "" {
@@ -1598,6 +1630,9 @@ func settingsCertificatesDeleteHandler(sessionRepo repository.SessionRepository,
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
 			http.Error(w, "No organization found", http.StatusBadRequest)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 

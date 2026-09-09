@@ -233,3 +233,27 @@ func TestResolveSharedOrg(t *testing.T) {
 		}
 	})
 }
+
+func TestRoleAllows(t *testing.T) {
+	tests := []struct {
+		name     string
+		member   *models.OrgMember
+		required models.Role
+		want     bool
+	}{
+		{"no membership", nil, models.RoleViewer, false},
+		{"viewer below operator", &models.OrgMember{Role: models.RoleViewer}, models.RoleOperator, false},
+		{"viewer is a viewer", &models.OrgMember{Role: models.RoleViewer}, models.RoleViewer, true},
+		{"operator below admin", &models.OrgMember{Role: models.RoleOperator}, models.RoleAdmin, false},
+		{"admin at least operator", &models.OrgMember{Role: models.RoleAdmin}, models.RoleOperator, true},
+		{"owner at least admin", &models.OrgMember{Role: models.RoleOwner}, models.RoleAdmin, true},
+		{"unknown role never passes", &models.OrgMember{Role: "root"}, models.RoleViewer, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := roleAllows(tt.member, tt.required); got != tt.want {
+				t.Fatalf("roleAllows = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
