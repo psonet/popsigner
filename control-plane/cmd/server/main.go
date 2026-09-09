@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -67,6 +68,7 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 	cookieDomain = cfg.Auth.CookieDomain
+	loginPolicy = service.NewLoginPolicy(cfg.Auth.AllowedEmailDomains, cfg.Auth.AllowedEmails)
 
 	logger.Info("Starting Control Plane API",
 		slog.String("environment", cfg.Server.Environment),
@@ -495,7 +497,12 @@ func signupPageHandler() http.HandlerFunc {
 func oauthRedirectHandler(oauthSvc service.OAuthService, provider string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Generate a random state for CSRF protection
-		state := fmt.Sprintf("%d", time.Now().UnixNano())
+		state, err := newOAuthState()
+		if err != nil {
+			slog.Error("Failed to generate OAuth state", slog.String("error", err.Error()))
+			http.Redirect(w, r, "/login?error="+url.QueryEscape("Login unavailable, please try again"), http.StatusFound)
+			return
+		}
 
 		authURL, err := oauthSvc.GetAuthURL(provider, state)
 		if err != nil {
@@ -522,10 +529,12 @@ func oauthRedirectHandler(oauthSvc service.OAuthService, provider string) http.H
 			// Check if coming from POPKins subdomain
 			host := strings.ToLower(r.Host)
 			if strings.HasPrefix(host, "popkins.") {
-				returnTo = "https://popkins.popsigner.com/deployments"
+				returnTo = popkinsReturnTo(host)
 			} else {
 				returnTo = "/dashboard"
 			}
+		} else {
+			returnTo = safeReturnTo(returnTo)
 		}
 
 		// Set cookie domain to share across all subdomains
@@ -555,8 +564,12 @@ func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *c
 			return
 		}
 
-		// TODO: Verify state parameter matches cookie for CSRF protection
-		// For now, we'll skip this for simplicity
+		stateCookie, err := r.Cookie("oauth_state")
+		if err != nil || !stateMatches(stateCookie.Value, r.URL.Query().Get("state")) {
+			slog.Warn("OAuth callback state mismatch", slog.String("provider", provider))
+			http.Redirect(w, r, "/login?error="+url.QueryEscape("Login expired, please try again"), http.StatusFound)
+			return
+		}
 
 		// Handle the OAuth callback - this exchanges code for token, fetches user info, creates/finds user, creates session
 		user, sessionID, err := oauthSvc.HandleCallback(r.Context(), provider, code)
@@ -565,7 +578,11 @@ func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *c
 				slog.String("provider", provider),
 				slog.String("error", err.Error()),
 			)
-			http.Redirect(w, r, "/login?error="+url.QueryEscape("Authentication failed: "+err.Error()), http.StatusFound)
+			message := "Authentication failed: " + err.Error()
+			if errors.Is(err, service.ErrEmailNotAllowed) {
+				message = notAllowedLoginError
+			}
+			http.Redirect(w, r, "/login?error="+url.QueryEscape(message), http.StatusFound)
 			return
 		}
 
@@ -598,13 +615,10 @@ func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *c
 		// Get return URL from cookie (set during OAuth redirect)
 		returnTo := "/dashboard" // default for main dashboard
 		if cookie, err := r.Cookie("oauth_return_to"); err == nil && cookie.Value != "" {
-			returnTo = cookie.Value
-		} else {
+			returnTo = safeReturnTo(cookie.Value)
+		} else if referer, err := url.Parse(r.Header.Get("Referer")); err == nil && strings.HasPrefix(strings.ToLower(referer.Host), "popkins.") {
 			// If no cookie, check Referer header for subdomain hint
-			referer := r.Header.Get("Referer")
-			if strings.Contains(referer, "popkins.") {
-				returnTo = "https://popkins.popsigner.com/deployments"
-			}
+			returnTo = popkinsReturnTo(strings.ToLower(referer.Host))
 		}
 
 		// Clear the return URL cookie (must match domain used when setting)
@@ -761,6 +775,20 @@ func getAuthenticatedUser(w http.ResponseWriter, r *http.Request, sessionRepo re
 	user, err := userRepo.GetByID(r.Context(), session.UserID)
 	if err != nil || user == nil {
 		http.Redirect(w, r, "/login", http.StatusFound)
+		return nil
+	}
+
+	// Re-check the allowlist so removing an address revokes existing sessions on their next request.
+	if !loginPolicy.Allows(user.Email) {
+		_ = sessionRepo.Delete(r.Context(), cookie.Value)
+		http.SetCookie(w, &http.Cookie{
+			Name:   sessionCookieName,
+			Value:  "",
+			Path:   "/",
+			Domain: cookieDomain,
+			MaxAge: -1,
+		})
+		http.Redirect(w, r, "/login?error="+url.QueryEscape(notAllowedLoginError), http.StatusFound)
 		return nil
 	}
 
