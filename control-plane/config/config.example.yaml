@@ -60,6 +60,19 @@ auth:
   oauth_google_id: ""
   oauth_google_secret: ""
 
+  # Domain attribute on auth cookies; "" means host-only cookies
+  cookie_domain: ".popsigner.com"
+
+  # Login allowlist. Both empty = anyone who can complete OAuth may sign in.
+  allowed_email_domains: []   # e.g. ["example.com"]
+  allowed_emails: []          # e.g. ["contractor@partner.example"]
+
+  # Shared organization. Set a slug to make every allowed login a member of one
+  # organization instead of creating a personal one per user.
+  shared_org: ""              # e.g. "platform"
+  owner_emails: []            # members listed here are owners; everyone else joins as default_role
+  default_role: "operator"    # admin | operator | viewer
+
 # NOTE: Billing (Stripe) integration is planned for a future release.
 # For now, all users have access to full functionality.
 
