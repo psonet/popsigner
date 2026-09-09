@@ -84,6 +84,14 @@ type AuthConfig struct {
 	// CookieDomain is the Domain attribute on auth cookies. Empty means host-only
 	// (no Domain attribute), for deployments served from a single hostname.
 	CookieDomain string `mapstructure:"cookie_domain"`
+	// Login is refused unless the email matches one of these; both empty leaves login open.
+	AllowedEmailDomains []string `mapstructure:"allowed_email_domains"`
+	AllowedEmails       []string `mapstructure:"allowed_emails"`
+	// SharedOrg is the slug of the single organization every allowed login joins.
+	// Empty keeps one organization per user.
+	SharedOrg   string   `mapstructure:"shared_org"`
+	OwnerEmails []string `mapstructure:"owner_emails"`
+	DefaultRole string   `mapstructure:"default_role"`
 }
 
 // Load reads configuration from files and environment variables.
@@ -113,6 +121,11 @@ func Load() (*Config, error) {
 	v.BindEnv("auth.oauth_google_secret", "BANHBAO_AUTH_OAUTH_GOOGLE_SECRET")
 	v.BindEnv("auth.oauth_callback_url", "BANHBAO_AUTH_OAUTH_CALLBACK_URL")
 	v.BindEnv("auth.cookie_domain", "BANHBAO_AUTH_COOKIE_DOMAIN")
+	v.BindEnv("auth.allowed_email_domains", "BANHBAO_AUTH_ALLOWED_EMAIL_DOMAINS")
+	v.BindEnv("auth.allowed_emails", "BANHBAO_AUTH_ALLOWED_EMAILS")
+	v.BindEnv("auth.shared_org", "BANHBAO_AUTH_SHARED_ORG")
+	v.BindEnv("auth.owner_emails", "BANHBAO_AUTH_OWNER_EMAILS")
+	v.BindEnv("auth.default_role", "BANHBAO_AUTH_DEFAULT_ROLE")
 
 	// Explicitly bind OpenBao environment variables
 	v.BindEnv("openbao.address", "BANHBAO_OPENBAO_ADDRESS")
@@ -175,4 +188,5 @@ func setDefaults(v *viper.Viper) {
 	// Matches the previously hardcoded value so existing deployments keep sharing
 	// cookies across popsigner.com subdomains.
 	v.SetDefault("auth.cookie_domain", ".popsigner.com")
+	v.SetDefault("auth.default_role", "operator")
 }
