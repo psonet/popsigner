@@ -2,7 +2,9 @@ package pages
 
 import (
 	"github.com/Bidon15/popsigner/control-plane/internal/models"
+	"github.com/Bidon15/popsigner/control-plane/templates/components"
 	"github.com/Bidon15/popsigner/control-plane/templates/layouts"
+	"github.com/google/uuid"
 	"strings"
 )
 
@@ -10,6 +12,7 @@ import (
 type APIKeysPageData struct {
 	layouts.DashboardData
 	APIKeys     []*models.APIKey
+	KeyNames    map[uuid.UUID]string
 	CanCreate   bool
 }
 
@@ -55,7 +58,7 @@ templ SettingsAPIKeysPage(data APIKeysPageData) {
 			
 			<!-- API Keys List -->
 			<div id="api-keys-list">
-				@APIKeysList(data.APIKeys)
+				@APIKeysList(data.APIKeys, data.KeyNames)
 			</div>
 			
 			<!-- Usage Examples - CRT Terminal Style -->
@@ -83,7 +86,7 @@ templ SettingsAPIKeysPage(data APIKeysPageData) {
 }
 
 // APIKeysList renders the list of API keys (for HTMX partial updates).
-templ APIKeysList(keys []*models.APIKey) {
+templ APIKeysList(keys []*models.APIKey, keyNames map[uuid.UUID]string) {
 	<div class="bg-black border border-[#333300]">
 		if len(keys) > 0 {
 			<div class="divide-y divide-[#333300]">
@@ -124,6 +127,20 @@ templ APIKeysList(keys []*models.APIKey) {
 									for _, scope := range key.Scopes {
 										<span class="px-2 py-0.5 text-xs font-mono bg-[#1A4D1A] text-[#33FF00] border border-[#228B22]">
 											{ scope }
+										</span>
+									}
+								</div>
+								<!-- Key bindings -->
+								<div class="flex flex-wrap gap-1.5 mt-2">
+									if key.IsBound() {
+										for _, keyID := range key.AllowedKeyIDs {
+											<span class="px-2 py-0.5 text-xs font-mono bg-[#1A4D1A] text-[#33FF00] border border-[#228B22]">
+												{ boundKeyLabel(keyNames, keyID) }
+											</span>
+										}
+									} else {
+										<span class="px-2 py-0.5 text-xs font-bold bg-[#FFB000]/10 text-[#FFB000] border border-[#FFB000] uppercase">
+											ORG-WIDE
 										</span>
 									}
 								</div>
@@ -169,7 +186,7 @@ templ APIKeysList(keys []*models.APIKey) {
 }
 
 // CreateAPIKeyModal renders the create API key modal.
-templ CreateAPIKeyModal() {
+templ CreateAPIKeyModal(keys []components.KeyOption) {
 	<div class="max-w-lg w-full bg-black border border-[#333300]">
 		<!-- Header -->
 		<div class="flex items-center justify-between p-5 border-b border-[#333300]">
@@ -219,6 +236,24 @@ templ CreateAPIKeyModal() {
 							@scopeCheckbox("webhooks:write", "MANAGE WEBHOOKS", "Create and delete webhooks")
 						</div>
 						<p class="mt-2 text-xs text-[#CC8800]">⚠ Select at least one permission</p>
+					</div>
+					
+					<div class="mt-6">
+						<label class="block text-sm font-bold text-[#FFB000] mb-3 uppercase">
+							KEYS THIS CREDENTIAL MAY USE
+						</label>
+						if len(keys) > 0 {
+							<div class="grid grid-cols-2 gap-3">
+								for _, key := range keys {
+									@keyCheckbox(key)
+								}
+							</div>
+						} else {
+							<p class="text-xs text-[#666600]">No signing keys yet. Create a key first, or issue an organization-wide credential.</p>
+						}
+						<div class="mt-3">
+							@orgWideCheckbox()
+						</div>
 					</div>
 					
 					<div class="mt-6">
@@ -322,6 +357,36 @@ templ scopeCheckbox(scope, label, description string) {
 	</label>
 }
 
+templ keyCheckbox(key components.KeyOption) {
+	<label class="flex items-start gap-3 p-3 bg-black border border-[#333300] cursor-pointer 
+	              hover:border-[#33FF00]/50 transition-colors has-[:checked]:border-[#33FF00] has-[:checked]:bg-[#33FF00]/5">
+		<input type="checkbox" 
+			   name="key_ids" 
+			   value={ key.ID }
+			   class="mt-0.5 w-4 h-4 bg-black border-[#333300] text-[#33FF00] 
+			          focus:ring-[#33FF00] focus:ring-offset-0 accent-[#33FF00]"/>
+		<div class="min-w-0">
+			<p class="text-sm font-bold text-[#FFB000] uppercase truncate">{ key.Name }</p>
+			<p class="text-xs font-mono text-[#666600]">{ truncateAddress(key.Address) }</p>
+		</div>
+	</label>
+}
+
+templ orgWideCheckbox() {
+	<label class="flex items-start gap-3 p-3 bg-black border border-[#333300] cursor-pointer 
+	              hover:border-[#FFB000]/50 transition-colors has-[:checked]:border-[#FFB000] has-[:checked]:bg-[#FFB000]/5">
+		<input type="checkbox" 
+			   name="org_wide" 
+			   value="on"
+			   class="mt-0.5 w-4 h-4 bg-black border-[#333300] text-[#FFB000] 
+			          focus:ring-[#FFB000] focus:ring-offset-0 accent-[#FFB000]"/>
+		<div>
+			<p class="text-sm font-bold text-[#FFB000] uppercase">ORG-WIDE ACCESS</p>
+			<p class="text-xs text-[#666600]">Every key in the organization, including keys created later. Not recommended for validator nodes.</p>
+		</div>
+	</label>
+}
+
 // APIKeyCreateError renders an error message for the create API key form.
 templ APIKeyCreateError(message string) {
 	<div class="space-y-6">
@@ -401,6 +466,14 @@ templ APIKeyCreatedSuccess(rawKey string, prefix string) {
 			</button>
 		</div>
 	</div>
+}
+
+// boundKeyLabel names a bound key, falling back to its id when the key is gone.
+func boundKeyLabel(keyNames map[uuid.UUID]string, keyID uuid.UUID) string {
+	if name, ok := keyNames[keyID]; ok {
+		return name
+	}
+	return keyID.String()
 }
 
 func apiKeyIconClass(key *models.APIKey) string {

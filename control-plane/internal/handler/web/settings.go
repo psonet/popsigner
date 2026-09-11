@@ -412,7 +412,7 @@ func (h *WebHandler) SettingsAPIKeysNewModal(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	
-	component := pages.CreateAPIKeyModal()
+	component := pages.CreateAPIKeyModal(nil)
 	templ.Handler(component).ServeHTTP(w, r)
 }
 
@@ -443,7 +443,7 @@ func (h *WebHandler) SettingsAPIKeysDelete(w http.ResponseWriter, r *http.Reques
 
 	// Re-render the API keys list
 	apiKeys, _ := h.apiKeyService.List(ctx, org.ID)
-	component := pages.APIKeysList(apiKeys)
+	component := pages.APIKeysList(apiKeys, nil)
 	templ.Handler(component).ServeHTTP(w, r)
 }
 

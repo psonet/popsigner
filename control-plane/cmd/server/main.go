@@ -324,8 +324,8 @@ func main() {
 	r.Get("/keys/{id}", keyViewHandler(sessionRepo, userRepo, orgRepo, keySvc))
 	r.Delete("/keys/{id}", keyDeleteHandler(sessionRepo, userRepo, orgRepo, keyRepo, keySvc))
 	r.Post("/keys/{id}/sign-test", keySignHandler(sessionRepo, userRepo, orgRepo, keySvc))
-	r.Get("/settings/api-keys", settingsAPIKeysHandler(sessionRepo, userRepo, orgRepo, apiKeyRepo))
-	r.Get("/settings/api-keys/new", settingsAPIKeysNewHandler(sessionRepo, userRepo, orgRepo))
+	r.Get("/settings/api-keys", settingsAPIKeysHandler(sessionRepo, userRepo, orgRepo, apiKeyRepo, keyRepo))
+	r.Get("/settings/api-keys/new", settingsAPIKeysNewHandler(sessionRepo, userRepo, orgRepo, keyRepo))
 	r.Post("/settings/api-keys", settingsAPIKeysCreateHandler(sessionRepo, userRepo, orgRepo, apiKeySvc))
 	r.Delete("/settings/api-keys/{id}", settingsAPIKeysDeleteHandler(sessionRepo, userRepo, orgRepo, apiKeySvc))
 	r.Get("/settings/profile", settingsProfileHandler(sessionRepo, userRepo))
@@ -1172,7 +1172,7 @@ func keyDeleteHandler(sessionRepo repository.SessionRepository, userRepo reposit
 }
 
 // settingsAPIKeysHandler serves the API keys settings page.
-func settingsAPIKeysHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, orgRepo repository.OrgRepository, apiKeyRepo repository.APIKeyRepository) http.HandlerFunc {
+func settingsAPIKeysHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, orgRepo repository.OrgRepository, apiKeyRepo repository.APIKeyRepository, keyRepo repository.KeyRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := getAuthenticatedUser(w, r, sessionRepo, userRepo)
 		if user == nil {
@@ -1206,6 +1206,18 @@ func settingsAPIKeysHandler(sessionRepo repository.SessionRepository, userRepo r
 		dashData.OrgName = org.Name
 		dashData.OrgPlan = string(org.Plan)
 
+		keyNames := make(map[uuid.UUID]string)
+		keys, err := keyRepo.ListByOrg(r.Context(), org.ID)
+		if err != nil {
+			slog.Error("Failed to list keys for API key bindings",
+				slog.String("error", err.Error()),
+				slog.String("org_id", org.ID.String()),
+			)
+		}
+		for _, key := range keys {
+			keyNames[key.ID] = key.Name
+		}
+
 		data := pages.APIKeysPageData{
 			DashboardData: layouts.DashboardData{
 				UserName:   dashData.UserName,
@@ -1216,6 +1228,7 @@ func settingsAPIKeysHandler(sessionRepo repository.SessionRepository, userRepo r
 				ActivePath: dashData.ActivePath,
 			},
 			APIKeys:   apiKeys,
+			KeyNames:  keyNames,
 			CanCreate: true,
 		}
 
@@ -1225,7 +1238,7 @@ func settingsAPIKeysHandler(sessionRepo repository.SessionRepository, userRepo r
 }
 
 // settingsAPIKeysNewHandler returns the create API key modal.
-func settingsAPIKeysNewHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, orgRepo repository.OrgRepository) http.HandlerFunc {
+func settingsAPIKeysNewHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, orgRepo repository.OrgRepository, keyRepo repository.KeyRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := getAuthenticatedUser(w, r, sessionRepo, userRepo)
 		if user == nil {
@@ -1242,8 +1255,16 @@ func settingsAPIKeysNewHandler(sessionRepo repository.SessionRepository, userRep
 			return
 		}
 
+		keys, err := keyRepo.ListByOrg(r.Context(), org.ID)
+		if err != nil {
+			slog.Error("Failed to list keys for the API key modal",
+				slog.String("error", err.Error()),
+				slog.String("org_id", org.ID.String()),
+			)
+		}
+
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		pages.CreateAPIKeyModal().Render(r.Context(), w)
+		pages.CreateAPIKeyModal(keyOptions(keys)).Render(r.Context(), w)
 	}
 }
 
@@ -1287,10 +1308,29 @@ func settingsAPIKeysCreateHandler(sessionRepo repository.SessionRepository, user
 			return
 		}
 
+		allowedKeyIDs := make([]uuid.UUID, 0, len(r.Form["key_ids"]))
+		for _, rawID := range r.Form["key_ids"] {
+			keyID, err := uuid.Parse(rawID)
+			if err != nil {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				pages.APIKeyCreateError("Invalid key selection").Render(r.Context(), w)
+				return
+			}
+			allowedKeyIDs = append(allowedKeyIDs, keyID)
+		}
+		if len(allowedKeyIDs) == 0 && r.FormValue("org_wide") != "on" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			pages.APIKeyCreateError("Please select at least one key, or confirm organization-wide access").Render(r.Context(), w)
+			return
+		}
+
 		// Create the API key
 		req := service.CreateAPIKeyRequest{
-			Name:   name,
-			Scopes: scopes,
+			Name:          name,
+			Scopes:        scopes,
+			AllowedKeyIDs: allowedKeyIDs,
+			UserID:        &user.ID,
+			ExpiresInDays: expiresInDays(r.FormValue("expires")),
 		}
 		apiKey, rawKey, err := apiKeySvc.Create(r.Context(), org.ID, req)
 		if err != nil {
@@ -1310,6 +1350,33 @@ func settingsAPIKeysCreateHandler(sessionRepo repository.SessionRepository, user
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		pages.APIKeyCreatedSuccess(rawKey, apiKey.KeyPrefix).Render(r.Context(), w)
 	}
+}
+
+// keyOptions adapts organization keys for the key selection checkboxes.
+func keyOptions(keys []*models.Key) []components.KeyOption {
+	options := make([]components.KeyOption, 0, len(keys))
+	for _, key := range keys {
+		address := key.Address
+		if key.EthAddress != nil && *key.EthAddress != "" {
+			address = *key.EthAddress
+		}
+		options = append(options, components.KeyOption{
+			ID:         key.ID.String(),
+			Name:       key.Name,
+			Address:    address,
+			CosmosAddr: key.Address,
+		})
+	}
+	return options
+}
+
+// expiresInDays maps the expiration select values to a lifetime in days.
+func expiresInDays(expires string) *int {
+	days, ok := map[string]int{"30d": 30, "90d": 90, "1y": 365}[expires]
+	if !ok {
+		return nil
+	}
+	return &days
 }
 
 // settingsAPIKeysDeleteHandler handles revoking an API key.
