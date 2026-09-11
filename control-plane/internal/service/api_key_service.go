@@ -49,19 +49,22 @@ type APIKeyService interface {
 
 // CreateAPIKeyRequest is the request for creating a new API key.
 type CreateAPIKeyRequest struct {
-	Name         string   `json:"name" validate:"required,min=1,max=255"`
-	Scopes       []string `json:"scopes" validate:"required,min=1"`
-	ExpiresInDays *int    `json:"expires_in_days,omitempty"` // Days until expiry, nil = no expiry
-	Environment  string   `json:"environment,omitempty"`     // "live" or "test", defaults to "live"
+	Name          string      `json:"name" validate:"required,min=1,max=255"`
+	Scopes        []string    `json:"scopes" validate:"required,min=1"`
+	AllowedKeyIDs []uuid.UUID `json:"allowed_key_ids,omitempty"` // Signing keys the credential may use, empty = every key of the org
+	UserID        *uuid.UUID  `json:"user_id,omitempty"`         // Issuing user, nil for keys issued by the platform
+	ExpiresInDays *int        `json:"expires_in_days,omitempty"` // Days until expiry, nil = no expiry
+	Environment   string      `json:"environment,omitempty"`     // "live" or "test", defaults to "live"
 }
 
 type apiKeyService struct {
-	keyRepo repository.APIKeyRepository
+	keyRepo     repository.APIKeyRepository
+	signingKeys repository.KeyRepository
 }
 
 // NewAPIKeyService creates a new API key service.
-func NewAPIKeyService(keyRepo repository.APIKeyRepository) APIKeyService {
-	return &apiKeyService{keyRepo: keyRepo}
+func NewAPIKeyService(keyRepo repository.APIKeyRepository, signingKeys repository.KeyRepository) APIKeyService {
+	return &apiKeyService{keyRepo: keyRepo, signingKeys: signingKeys}
 }
 
 // Create generates a new API key for an organization.
@@ -91,6 +94,17 @@ func (s *apiKeyService) Create(ctx context.Context, orgID uuid.UUID, req CreateA
 		env = req.Environment
 	}
 
+	// Every bound key must be a live key of this organization
+	for _, keyID := range req.AllowedKeyIDs {
+		signingKey, err := s.signingKeys.GetByID(ctx, keyID)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to look up key %s: %w", keyID, err)
+		}
+		if signingKey == nil || signingKey.OrgID != orgID || signingKey.DeletedAt != nil {
+			return nil, "", apierrors.NewValidationError("allowed_key_ids", fmt.Sprintf("unknown key: %s", keyID))
+		}
+	}
+
 	// Generate raw key
 	rawKey, prefix, err := s.generateKey(env)
 	if err != nil {
@@ -104,11 +118,13 @@ func (s *apiKeyService) Create(ctx context.Context, orgID uuid.UUID, req CreateA
 	}
 
 	key := &models.APIKey{
-		OrgID:     orgID,
-		Name:      req.Name,
-		KeyPrefix: prefix,
-		KeyHash:   hash,
-		Scopes:    req.Scopes,
+		OrgID:         orgID,
+		UserID:        req.UserID,
+		Name:          req.Name,
+		KeyPrefix:     prefix,
+		KeyHash:       hash,
+		Scopes:        req.Scopes,
+		AllowedKeyIDs: req.AllowedKeyIDs,
 	}
 
 	// Set expiration if specified

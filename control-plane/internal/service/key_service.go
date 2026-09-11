@@ -294,7 +294,7 @@ func (s *keyService) Get(ctx context.Context, orgID, keyID uuid.UUID) (*models.K
 	if err != nil {
 		return nil, fmt.Errorf("failed to get key: %w", err)
 	}
-	if key == nil || key.OrgID != orgID || key.DeletedAt != nil {
+	if key == nil || key.OrgID != orgID || key.DeletedAt != nil || !AllowsKey(ctx, keyID) {
 		return nil, apierrors.NewNotFoundError("Key")
 	}
 	return key, nil
@@ -323,6 +323,17 @@ func (s *keyService) List(ctx context.Context, orgID uuid.UUID, namespaceID *uui
 		return nil, fmt.Errorf("failed to list keys: %w", err)
 	}
 
+	// Restrict to the keys the calling credential is bound to
+	if identity, ok := APIKeyIdentityFromContext(ctx); ok && len(identity.AllowedKeyIDs) > 0 {
+		allowed := make([]*models.Key, 0, len(keys))
+		for _, k := range keys {
+			if AllowsKey(ctx, k.ID) {
+				allowed = append(allowed, k)
+			}
+		}
+		keys = allowed
+	}
+
 	// Filter by network type if specified
 	if networkType != nil && *networkType != models.NetworkTypeAll {
 		filtered := make([]*models.Key, 0, len(keys))
@@ -343,7 +354,7 @@ func (s *keyService) Delete(ctx context.Context, orgID, keyID uuid.UUID) error {
 	if err != nil {
 		return fmt.Errorf("failed to get key: %w", err)
 	}
-	if key == nil || key.OrgID != orgID {
+	if key == nil || key.OrgID != orgID || !AllowsKey(ctx, keyID) {
 		return apierrors.NewNotFoundError("Key")
 	}
 
@@ -372,7 +383,7 @@ func (s *keyService) Sign(ctx context.Context, orgID, keyID uuid.UUID, data []by
 	if err != nil {
 		return nil, apierrors.NewInternalError(fmt.Sprintf("failed to get key: %v", err))
 	}
-	if key == nil || key.OrgID != orgID || key.DeletedAt != nil {
+	if key == nil || key.OrgID != orgID || key.DeletedAt != nil || !AllowsKey(ctx, keyID) {
 		return nil, apierrors.NewNotFoundError("Key")
 	}
 
@@ -402,6 +413,13 @@ func (s *keyService) Sign(ctx context.Context, orgID, keyID uuid.UUID, data []by
 
 // SignBatch signs multiple messages in parallel.
 func (s *keyService) SignBatch(ctx context.Context, req SignBatchKeyRequest) ([]*SignKeyResponse, error) {
+	// Reject the whole batch before signing anything if it reaches beyond the binding
+	for _, signReq := range req.Requests {
+		if !AllowsKey(ctx, signReq.KeyID) {
+			return nil, apierrors.ErrForbidden.WithMessage("API key is not allowed to use every key in this batch")
+		}
+	}
+
 	// Check quota for all signatures
 	if err := s.checkSignatureQuota(ctx, req.OrgID); err != nil {
 		return nil, err
@@ -492,7 +510,7 @@ func (s *keyService) Export(ctx context.Context, orgID, keyID uuid.UUID) (string
 	if err != nil {
 		return "", fmt.Errorf("failed to get key: %w", err)
 	}
-	if key == nil || key.OrgID != orgID || key.DeletedAt != nil {
+	if key == nil || key.OrgID != orgID || key.DeletedAt != nil || !AllowsKey(ctx, keyID) {
 		return "", apierrors.NewNotFoundError("Key")
 	}
 

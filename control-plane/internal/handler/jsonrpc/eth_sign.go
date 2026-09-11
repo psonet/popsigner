@@ -76,13 +76,14 @@ func (h *EthSignHandler) signMessage(ctx context.Context, params json.RawMessage
 		dataHex = args[1]
 	}
 
-	// Lookup key by address
-	key, err := h.keyRepo.GetByEthAddress(ctx, orgID, addressHex)
-	if err != nil {
-		return nil, ErrInternal(fmt.Sprintf("failed to lookup key: %v", err))
+	if scopeErr := requireScope(ctx, scopeKeysSign); scopeErr != nil {
+		return nil, scopeErr
 	}
-	if key == nil {
-		return nil, ErrResourceNotFound(fmt.Sprintf("no key found for address %s", addressHex))
+
+	// Lookup key by address
+	key, keyErr := resolveKey(ctx, h.keyRepo, orgID, addressHex)
+	if keyErr != nil {
+		return nil, keyErr
 	}
 
 	// Decode the data

@@ -46,9 +46,20 @@ func APIKeyAuth(apiKeyService service.APIKeyService) func(http.Handler) http.Han
 			ctx = context.WithValue(ctx, OrgIDKey, apiKey.OrgID.String())
 			ctx = context.WithValue(ctx, APIKeyIDKey, apiKey.ID.String())
 			ctx = context.WithValue(ctx, ScopesContextKey, apiKey.Scopes)
+			ctx = service.WithAPIKeyIdentity(ctx, apiKeyIdentity(r, apiKey))
 
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
+	}
+}
+
+// apiKeyIdentity builds the identity the service layer uses for key binding and audit.
+func apiKeyIdentity(r *http.Request, apiKey *models.APIKey) service.APIKeyIdentity {
+	return service.APIKeyIdentity{
+		KeyID:         apiKey.ID,
+		AllowedKeyIDs: apiKey.AllowedKeyIDs,
+		IPAddress:     getRealIP(r),
+		UserAgent:     r.UserAgent(),
 	}
 }
 
@@ -222,6 +233,7 @@ func OptionalAPIKeyAuth(apiKeyService service.APIKeyService) func(http.Handler) 
 			ctx = context.WithValue(ctx, OrgIDKey, apiKey.OrgID.String())
 			ctx = context.WithValue(ctx, APIKeyIDKey, apiKey.ID.String())
 			ctx = context.WithValue(ctx, ScopesContextKey, apiKey.Scopes)
+			ctx = service.WithAPIKeyIdentity(ctx, apiKeyIdentity(r, apiKey))
 
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -397,6 +400,7 @@ func (m *mockOrgRepo) UpdatePlan(ctx context.Context, orgID uuid.UUID, plan mode
 }
 
 type mockAuditRepo struct {
+	mu   sync.Mutex // the service writes audit logs from its own goroutines
 	logs []*models.AuditLog
 }
 
@@ -405,6 +409,8 @@ func newMockAuditRepo() *mockAuditRepo {
 }
 
 func (m *mockAuditRepo) Create(ctx context.Context, log *models.AuditLog) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if log.ID == uuid.Nil {
 		log.ID = uuid.New()
 	}
@@ -414,6 +420,8 @@ func (m *mockAuditRepo) Create(ctx context.Context, log *models.AuditLog) error 
 }
 
 func (m *mockAuditRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.AuditLog, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, log := range m.logs {
 		if log.ID == id {
 			return log, nil
@@ -423,6 +431,8 @@ func (m *mockAuditRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.Audi
 }
 
 func (m *mockAuditRepo) List(ctx context.Context, query models.AuditLogQuery) ([]*models.AuditLog, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var result []*models.AuditLog
 	for _, log := range m.logs {
 		if log.OrgID == query.OrgID {
@@ -437,6 +447,8 @@ func (m *mockAuditRepo) DeleteBefore(ctx context.Context, orgID uuid.UUID, befor
 }
 
 func (m *mockAuditRepo) CountByOrgAndPeriod(ctx context.Context, orgID uuid.UUID, start, end time.Time) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var count int64
 	for _, log := range m.logs {
 		if log.OrgID == orgID && !log.CreatedAt.Before(start) && !log.CreatedAt.After(end) {
@@ -447,6 +459,7 @@ func (m *mockAuditRepo) CountByOrgAndPeriod(ctx context.Context, orgID uuid.UUID
 }
 
 type mockUsageRepo struct {
+	mu    sync.Mutex       // the service increments usage from its own goroutines
 	usage map[string]int64 // orgID_metric -> value
 }
 
@@ -455,12 +468,16 @@ func newMockUsageRepo() *mockUsageRepo {
 }
 
 func (m *mockUsageRepo) Increment(ctx context.Context, orgID uuid.UUID, metric string, value int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	key := orgID.String() + "_" + metric
 	m.usage[key] += value
 	return nil
 }
 
 func (m *mockUsageRepo) GetCurrentPeriod(ctx context.Context, orgID uuid.UUID, metric string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	key := orgID.String() + "_" + metric
 	return m.usage[key], nil
 }
@@ -1188,6 +1205,129 @@ func TestKeyService_ImportExport(t *testing.T) {
 			t.Error("Export() expected error for non-exportable key")
 		}
 	})
+}
+
+func TestKeyService_KeyBinding(t *testing.T) {
+	ctx := context.Background()
+
+	// setup returns a service with two keys, plus a context bound to the first one.
+	setup := func(t *testing.T) (*testKeyService, uuid.UUID, *models.Key, *models.Key, context.Context) {
+		t.Helper()
+		ts := newTestKeyService()
+		orgID, nsID := ts.createTestOrgAndNamespace(models.PlanEnterprise)
+
+		mine, err := ts.svc.Create(ctx, CreateKeyRequest{OrgID: orgID, NamespaceID: nsID, Name: "mine", Exportable: true})
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		other, err := ts.svc.Create(ctx, CreateKeyRequest{OrgID: orgID, NamespaceID: nsID, Name: "other", Exportable: true})
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		boundCtx := WithAPIKeyIdentity(ctx, APIKeyIdentity{
+			KeyID:         uuid.New(),
+			AllowedKeyIDs: []uuid.UUID{mine.ID},
+		})
+		return ts, orgID, mine, other, boundCtx
+	}
+
+	t.Run("bound key stays usable", func(t *testing.T) {
+		ts, orgID, mine, _, boundCtx := setup(t)
+
+		if _, err := ts.svc.Get(boundCtx, orgID, mine.ID); err != nil {
+			t.Errorf("Get() error = %v", err)
+		}
+		if _, err := ts.svc.Sign(boundCtx, orgID, mine.ID, []byte("payload"), false); err != nil {
+			t.Errorf("Sign() error = %v", err)
+		}
+		if _, err := ts.svc.Export(boundCtx, orgID, mine.ID); err != nil {
+			t.Errorf("Export() error = %v", err)
+		}
+		if err := ts.svc.Delete(boundCtx, orgID, mine.ID); err != nil {
+			t.Errorf("Delete() error = %v", err)
+		}
+	})
+
+	t.Run("unbound key is reported as not found", func(t *testing.T) {
+		ts, orgID, _, other, boundCtx := setup(t)
+
+		if _, err := ts.svc.Get(boundCtx, orgID, other.ID); !isNotFound(err) {
+			t.Errorf("Get() error = %v, want not found", err)
+		}
+		if _, err := ts.svc.Sign(boundCtx, orgID, other.ID, []byte("payload"), false); !isNotFound(err) {
+			t.Errorf("Sign() error = %v, want not found", err)
+		}
+		if _, err := ts.svc.Export(boundCtx, orgID, other.ID); !isNotFound(err) {
+			t.Errorf("Export() error = %v, want not found", err)
+		}
+		if err := ts.svc.Delete(boundCtx, orgID, other.ID); !isNotFound(err) {
+			t.Errorf("Delete() error = %v, want not found", err)
+		}
+		if ts.baoKeyring.signCount != 0 {
+			t.Errorf("signCount = %d, want 0", ts.baoKeyring.signCount)
+		}
+	})
+
+	t.Run("list is filtered to the binding", func(t *testing.T) {
+		ts, orgID, mine, _, boundCtx := setup(t)
+
+		keys, err := ts.svc.List(boundCtx, orgID, nil, nil)
+		if err != nil {
+			t.Fatalf("List() error = %v", err)
+		}
+		if len(keys) != 1 || keys[0].ID != mine.ID {
+			t.Errorf("List() returned %d keys, want only %v", len(keys), mine.ID)
+		}
+	})
+
+	t.Run("batch is rejected whole when it reaches beyond the binding", func(t *testing.T) {
+		ts, orgID, mine, other, boundCtx := setup(t)
+
+		data := base64.StdEncoding.EncodeToString([]byte("payload"))
+		_, err := ts.svc.SignBatch(boundCtx, SignBatchKeyRequest{
+			OrgID: orgID,
+			Requests: []SignKeyRequest{
+				{KeyID: mine.ID, Data: data},
+				{KeyID: other.ID, Data: data},
+			},
+		})
+		if err == nil {
+			t.Fatal("SignBatch() expected error")
+		}
+		var apiErr *apierrors.APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusForbidden {
+			t.Errorf("SignBatch() error = %v, want forbidden", err)
+		}
+		if ts.baoKeyring.signCount != 0 {
+			t.Errorf("signCount = %d, want 0", ts.baoKeyring.signCount)
+		}
+	})
+
+	t.Run("credential without a binding is unrestricted", func(t *testing.T) {
+		ts, orgID, mine, other, _ := setup(t)
+
+		unboundCtx := WithAPIKeyIdentity(ctx, APIKeyIdentity{KeyID: uuid.New()})
+
+		keys, err := ts.svc.List(unboundCtx, orgID, nil, nil)
+		if err != nil {
+			t.Fatalf("List() error = %v", err)
+		}
+		if len(keys) != 2 {
+			t.Errorf("List() returned %d keys, want 2", len(keys))
+		}
+		if _, err := ts.svc.Sign(unboundCtx, orgID, mine.ID, []byte("payload"), false); err != nil {
+			t.Errorf("Sign(mine) error = %v", err)
+		}
+		if _, err := ts.svc.Sign(unboundCtx, orgID, other.ID, []byte("payload"), false); err != nil {
+			t.Errorf("Sign(other) error = %v", err)
+		}
+	})
+}
+
+func isNotFound(err error) bool {
+	var apiErr *apierrors.APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
 func TestKeyService_Metadata(t *testing.T) {

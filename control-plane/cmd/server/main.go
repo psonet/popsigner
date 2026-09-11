@@ -144,7 +144,7 @@ func main() {
 	// Initialize services
 	oauthSvc := service.NewOAuthService(&cfg.Auth, userRepo, sessionRepo)
 	keySvc := service.NewKeyService(keyRepo, orgRepo, auditRepo, usageRepo, baoClient)
-	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
+	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, keyRepo)
 	certSvc := service.NewCertificateService(certRepo, pkiAdapter, orgRepo, auditRepo)
 
 	// Initialize API handlers

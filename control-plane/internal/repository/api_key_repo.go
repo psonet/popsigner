@@ -36,8 +36,8 @@ func NewAPIKeyRepository(pool *pgxpool.Pool) APIKeyRepository {
 // Create inserts a new API key into the database.
 func (r *apiKeyRepo) Create(ctx context.Context, key *models.APIKey) error {
 	query := `
-		INSERT INTO api_keys (id, org_id, user_id, name, key_prefix, key_hash, scopes, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO api_keys (id, org_id, user_id, name, key_prefix, key_hash, scopes, allowed_key_ids, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING created_at`
 
 	key.ID = uuid.New()
@@ -49,6 +49,7 @@ func (r *apiKeyRepo) Create(ctx context.Context, key *models.APIKey) error {
 		key.KeyPrefix,
 		key.KeyHash,
 		key.Scopes,
+		key.AllowedKeyIDs,
 		key.ExpiresAt,
 	).Scan(&key.CreatedAt)
 }
@@ -56,7 +57,7 @@ func (r *apiKeyRepo) Create(ctx context.Context, key *models.APIKey) error {
 // GetByID retrieves an API key by its UUID.
 func (r *apiKeyRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.APIKey, error) {
 	query := `
-		SELECT id, org_id, user_id, name, key_prefix, key_hash, scopes,
+		SELECT id, org_id, user_id, name, key_prefix, key_hash, scopes, allowed_key_ids,
 		       last_used_at, expires_at, revoked_at, created_at
 		FROM api_keys WHERE id = $1`
 
@@ -69,6 +70,7 @@ func (r *apiKeyRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.APIKey,
 		&key.KeyPrefix,
 		&key.KeyHash,
 		&key.Scopes,
+		&key.AllowedKeyIDs,
 		&key.LastUsedAt,
 		&key.ExpiresAt,
 		&key.RevokedAt,
@@ -87,7 +89,7 @@ func (r *apiKeyRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.APIKey,
 // Used for quick lookup during validation.
 func (r *apiKeyRepo) GetByPrefix(ctx context.Context, prefix string) (*models.APIKey, error) {
 	query := `
-		SELECT id, org_id, user_id, name, key_prefix, key_hash, scopes,
+		SELECT id, org_id, user_id, name, key_prefix, key_hash, scopes, allowed_key_ids,
 		       last_used_at, expires_at, revoked_at, created_at
 		FROM api_keys WHERE key_prefix = $1`
 
@@ -100,6 +102,7 @@ func (r *apiKeyRepo) GetByPrefix(ctx context.Context, prefix string) (*models.AP
 		&key.KeyPrefix,
 		&key.KeyHash,
 		&key.Scopes,
+		&key.AllowedKeyIDs,
 		&key.LastUsedAt,
 		&key.ExpiresAt,
 		&key.RevokedAt,
@@ -118,7 +121,7 @@ func (r *apiKeyRepo) GetByPrefix(ctx context.Context, prefix string) (*models.AP
 // Used for exact key validation.
 func (r *apiKeyRepo) GetByHash(ctx context.Context, hash string) (*models.APIKey, error) {
 	query := `
-		SELECT id, org_id, user_id, name, key_prefix, key_hash, scopes,
+		SELECT id, org_id, user_id, name, key_prefix, key_hash, scopes, allowed_key_ids,
 		       last_used_at, expires_at, revoked_at, created_at
 		FROM api_keys WHERE key_hash = $1`
 
@@ -131,6 +134,7 @@ func (r *apiKeyRepo) GetByHash(ctx context.Context, hash string) (*models.APIKey
 		&key.KeyPrefix,
 		&key.KeyHash,
 		&key.Scopes,
+		&key.AllowedKeyIDs,
 		&key.LastUsedAt,
 		&key.ExpiresAt,
 		&key.RevokedAt,
@@ -149,7 +153,7 @@ func (r *apiKeyRepo) GetByHash(ctx context.Context, hash string) (*models.APIKey
 // Does not return the key hash for security.
 func (r *apiKeyRepo) ListByOrg(ctx context.Context, orgID uuid.UUID) ([]*models.APIKey, error) {
 	query := `
-		SELECT id, org_id, user_id, name, key_prefix, scopes,
+		SELECT id, org_id, user_id, name, key_prefix, scopes, allowed_key_ids,
 		       last_used_at, expires_at, revoked_at, created_at
 		FROM api_keys WHERE org_id = $1 ORDER BY created_at DESC`
 
@@ -169,6 +173,7 @@ func (r *apiKeyRepo) ListByOrg(ctx context.Context, orgID uuid.UUID) ([]*models.
 			&key.Name,
 			&key.KeyPrefix,
 			&key.Scopes,
+			&key.AllowedKeyIDs,
 			&key.LastUsedAt,
 			&key.ExpiresAt,
 			&key.RevokedAt,

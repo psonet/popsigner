@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/google/uuid"
+
 	"github.com/Bidon15/popsigner/control-plane/internal/middleware"
 	"github.com/Bidon15/popsigner/control-plane/internal/repository"
+	"github.com/Bidon15/popsigner/control-plane/internal/service"
 )
 
 // EthAccountsHandler handles eth_accounts requests.
@@ -27,6 +30,14 @@ func (h *EthAccountsHandler) Handle(ctx context.Context, params json.RawMessage)
 		return nil, ErrUnauthorized("missing organization context")
 	}
 
+	if scopeErr := requireScope(ctx, scopeKeysRead); scopeErr != nil {
+		return nil, scopeErr
+	}
+
+	if identity, ok := service.APIKeyIdentityFromContext(ctx); ok && len(identity.AllowedKeyIDs) > 0 {
+		return h.boundAddresses(ctx, orgID)
+	}
+
 	// List all Ethereum addresses for the org
 	addresses, err := h.keyRepo.ListEthAddresses(ctx, orgID)
 	if err != nil {
@@ -39,6 +50,22 @@ func (h *EthAccountsHandler) Handle(ctx context.Context, params json.RawMessage)
 		addresses = []string{}
 	}
 
+	return addresses, nil
+}
+
+// boundAddresses returns the Ethereum addresses of the keys the caller is bound to.
+func (h *EthAccountsHandler) boundAddresses(ctx context.Context, orgID uuid.UUID) (interface{}, *Error) {
+	keys, err := h.keyRepo.ListByOrg(ctx, orgID)
+	if err != nil {
+		return nil, ErrInternal(err.Error())
+	}
+
+	addresses := []string{}
+	for _, key := range keys {
+		if key.EthAddress != nil && *key.EthAddress != "" && service.AllowsKey(ctx, key.ID) {
+			addresses = append(addresses, *key.EthAddress)
+		}
+	}
 	return addresses, nil
 }
 

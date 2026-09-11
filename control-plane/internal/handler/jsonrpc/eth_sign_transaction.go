@@ -59,14 +59,15 @@ func (h *EthSignTransactionHandler) Handle(ctx context.Context, params json.RawM
 		return nil, ErrInvalidParams(err.Error())
 	}
 
+	if scopeErr := requireScope(ctx, scopeKeysSign); scopeErr != nil {
+		return nil, scopeErr
+	}
+
 	// Lookup key by from address
 	fromAddr := ethereum.EncodeAddress(*txArgs.From)
-	key, err := h.keyRepo.GetByEthAddress(ctx, orgID, fromAddr)
-	if err != nil {
-		return nil, ErrInternal(fmt.Sprintf("failed to lookup key: %v", err))
-	}
-	if key == nil {
-		return nil, ErrResourceNotFound(fmt.Sprintf("no key found for address %s", fromAddr))
+	key, keyErr := resolveKey(ctx, h.keyRepo, orgID, fromAddr)
+	if keyErr != nil {
+		return nil, keyErr
 	}
 
 	// Determine transaction type and construct unsigned transaction
