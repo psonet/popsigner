@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/sha3"
@@ -14,6 +15,7 @@ import (
 	"github.com/Bidon15/popsigner/control-plane/internal/models"
 	"github.com/Bidon15/popsigner/control-plane/internal/openbao"
 	"github.com/Bidon15/popsigner/control-plane/internal/repository"
+	"github.com/Bidon15/popsigner/control-plane/internal/service"
 )
 
 // EthSignHandler handles eth_sign and personal_sign requests.
@@ -120,26 +122,38 @@ func (h *EthSignHandler) signMessage(ctx context.Context, params json.RawMessage
 	sig[64] = byte(signResp.VInt)
 
 	// Log audit and increment usage asynchronously
-	go h.recordSignature(orgID, key.ID)
+	identity, _ := service.APIKeyIdentityFromContext(ctx)
+	go h.recordSignature(orgID, key.ID, identity)
 
 	return ethereum.EncodeBytes(sig), nil
 }
 
 // recordSignature logs the signing operation and increments usage counters.
-func (h *EthSignHandler) recordSignature(orgID, keyID uuid.UUID) {
+func (h *EthSignHandler) recordSignature(orgID, keyID uuid.UUID, identity service.APIKeyIdentity) {
 	ctx := context.Background()
 
 	// Create audit log
 	if h.auditRepo != nil {
 		resourceType := models.ResourceTypeKey
-		_ = h.auditRepo.Create(ctx, &models.AuditLog{
+		entry := &models.AuditLog{
 			ID:           uuid.New(),
 			OrgID:        orgID,
 			Event:        models.AuditEventKeySigned,
 			ActorType:    models.ActorTypeAPIKey,
 			ResourceType: &resourceType,
 			ResourceID:   &keyID,
-		})
+		}
+		if identity.KeyID != uuid.Nil {
+			actorID := identity.KeyID
+			entry.ActorID = &actorID
+			if ip := net.ParseIP(identity.IPAddress); ip != nil {
+				entry.IPAddress = &ip
+			}
+			if identity.UserAgent != "" {
+				entry.UserAgent = &identity.UserAgent
+			}
+		}
+		_ = h.auditRepo.Create(ctx, entry)
 	}
 
 	// Increment signature usage

@@ -1325,6 +1325,57 @@ func TestKeyService_KeyBinding(t *testing.T) {
 	})
 }
 
+func TestKeyService_SignAuditAttribution(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestKeyService()
+	orgID, nsID := ts.createTestOrgAndNamespace(models.PlanPro)
+
+	key, err := ts.svc.Create(ctx, CreateKeyRequest{OrgID: orgID, NamespaceID: nsID, Name: "sign-key"})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	identity := APIKeyIdentity{
+		KeyID:     uuid.New(),
+		IPAddress: "198.51.100.9",
+		UserAgent: "popsigner-sdk/1.0",
+	}
+	if _, err := ts.svc.Sign(WithAPIKeyIdentity(ctx, identity), orgID, key.ID, []byte("payload"), false); err != nil {
+		t.Fatalf("Sign() error = %v", err)
+	}
+
+	signed := waitForAuditLog(t, ts.auditRepo, orgID, models.AuditEventKeySigned)
+	if signed.ActorID == nil || *signed.ActorID != identity.KeyID {
+		t.Errorf("ActorID = %v, want %v", signed.ActorID, identity.KeyID)
+	}
+	if signed.IPAddress == nil || signed.IPAddress.String() != identity.IPAddress {
+		t.Errorf("IPAddress = %v, want %v", signed.IPAddress, identity.IPAddress)
+	}
+	if signed.UserAgent == nil || *signed.UserAgent != identity.UserAgent {
+		t.Errorf("UserAgent = %v, want %v", signed.UserAgent, identity.UserAgent)
+	}
+}
+
+// waitForAuditLog waits for the asynchronously written audit record of an event.
+func waitForAuditLog(t *testing.T, repo *mockAuditRepo, orgID uuid.UUID, event models.AuditEvent) *models.AuditLog {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		logs, err := repo.List(context.Background(), models.AuditLogQuery{OrgID: orgID})
+		if err != nil {
+			t.Fatalf("List() error = %v", err)
+		}
+		for _, log := range logs {
+			if log.Event == event {
+				return log
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("no %s audit record written", event)
+	return nil
+}
+
 func isNotFound(err error) bool {
 	var apiErr *apierrors.APIError
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound

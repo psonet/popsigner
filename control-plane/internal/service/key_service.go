@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"sync"
 
 	"github.com/google/uuid"
@@ -594,15 +595,28 @@ func (s *keyService) incrementUsage(ctx context.Context, orgID uuid.UUID, metric
 }
 
 func (s *keyService) auditLog(ctx context.Context, orgID uuid.UUID, event models.AuditEvent, resourceType models.ResourceType, resourceID uuid.UUID) {
+	entry := &models.AuditLog{
+		OrgID:        orgID,
+		Event:        event,
+		ActorType:    models.ActorTypeAPIKey, // Default to API key, can be overridden
+		ResourceType: &resourceType,
+		ResourceID:   &resourceID,
+	}
+	// Read the caller off the context before the goroutine outlives the request
+	if identity, ok := APIKeyIdentityFromContext(ctx); ok {
+		keyID := identity.KeyID
+		entry.ActorID = &keyID
+		if ip := net.ParseIP(identity.IPAddress); ip != nil {
+			entry.IPAddress = &ip
+		}
+		if identity.UserAgent != "" {
+			entry.UserAgent = &identity.UserAgent
+		}
+	}
+
 	// Run asynchronously to not block the request
 	go func() {
-		_ = s.auditRepo.Create(context.Background(), &models.AuditLog{
-			OrgID:        orgID,
-			Event:        event,
-			ActorType:    models.ActorTypeAPIKey, // Default to API key, can be overridden
-			ResourceType: &resourceType,
-			ResourceID:   &resourceID,
-		})
+		_ = s.auditRepo.Create(context.Background(), entry)
 	}()
 }
 
