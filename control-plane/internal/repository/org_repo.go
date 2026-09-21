@@ -78,7 +78,9 @@ func (r *orgRepo) Create(ctx context.Context, org *models.Organization, ownerID 
 
 	// Generate ID and unique slug
 	org.ID = uuid.New()
-	org.Slug = generateUniqueSlug(org.Name)
+	if org.Slug == "" {
+		org.Slug = generateUniqueSlug(org.Name)
+	}
 	org.Plan = models.PlanFree
 	now := time.Now()
 	org.CreatedAt = now

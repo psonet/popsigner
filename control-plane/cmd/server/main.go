@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -67,6 +68,20 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 	cookieDomain = cfg.Auth.CookieDomain
+	if err := service.ValidateLoginAllowlist(cfg.Auth.AllowedEmailDomains, cfg.Auth.AllowedEmails); err != nil {
+		log.Fatalf("Invalid config: %v", err)
+	}
+	loginPolicy = service.NewLoginPolicy(cfg.Auth.AllowedEmailDomains, cfg.Auth.AllowedEmails)
+	if orgAccess, err = newOrgPolicy(cfg.Auth); err != nil {
+		log.Fatalf("Invalid config: %v", err)
+	}
+	logger.Info("Access policy loaded",
+		slog.Bool("login_allowlist", loginPolicy.Enabled()),
+		slog.Int("allowed_email_domains", len(cfg.Auth.AllowedEmailDomains)),
+		slog.Int("allowed_emails", len(cfg.Auth.AllowedEmails)),
+		slog.Bool("shared_org", orgAccess.enabled()),
+		slog.Int("owner_emails", len(orgAccess.owners)),
+	)
 
 	logger.Info("Starting Control Plane API",
 		slog.String("environment", cfg.Server.Environment),
@@ -242,7 +257,10 @@ func main() {
 	deploymentHandler := bootstraphandler.NewDeploymentHandler(bootstrapRepo, unifiedOrch, orgSvc)
 	// POPKins uses same session mechanism as main dashboard (cookie + DB lookup)
 	// Pass the unified orchestrator so deployments are started automatically
-	popkinsHandler := popkins.NewHandler(authSvc, orgSvc, keySvc, bootstrapRepo, unifiedOrch, sessionRepo, userRepo)
+	resolveOrg := func(ctx context.Context, user *models.User) (*models.Organization, error) {
+		return ensureUserHasOrg(ctx, user, orgRepo)
+	}
+	popkinsHandler := popkins.NewHandler(authSvc, orgSvc, keySvc, bootstrapRepo, unifiedOrch, sessionRepo, userRepo, loginPolicy, resolveOrg)
 	logger.Info("POPKins handler initialized")
 
 	// Process any pending deployments from previous server runs
@@ -303,9 +321,9 @@ func main() {
 	r.Get("/keys", keysListHandler(sessionRepo, userRepo, orgRepo, keyRepo))
 	r.Post("/keys", keysCreateHandler(sessionRepo, userRepo, orgRepo, keySvc))
 	r.Get("/keys/new", keysNewHandler(sessionRepo, userRepo))
-	r.Get("/keys/{id}", keyViewHandler(sessionRepo, userRepo, keyRepo))
+	r.Get("/keys/{id}", keyViewHandler(sessionRepo, userRepo, orgRepo, keySvc))
 	r.Delete("/keys/{id}", keyDeleteHandler(sessionRepo, userRepo, orgRepo, keyRepo, keySvc))
-	r.Post("/keys/{id}/sign-test", keySignHandler(sessionRepo, userRepo, keyRepo, keySvc))
+	r.Post("/keys/{id}/sign-test", keySignHandler(sessionRepo, userRepo, orgRepo, keySvc))
 	r.Get("/settings/api-keys", settingsAPIKeysHandler(sessionRepo, userRepo, orgRepo, apiKeyRepo))
 	r.Get("/settings/api-keys/new", settingsAPIKeysNewHandler(sessionRepo, userRepo, orgRepo))
 	r.Post("/settings/api-keys", settingsAPIKeysCreateHandler(sessionRepo, userRepo, orgRepo, apiKeySvc))
@@ -330,7 +348,10 @@ func main() {
 	r.Get("/audit", auditHandler(sessionRepo, userRepo, orgRepo, auditRepo))
 
 	// Team management
-	r.Get("/settings/team", settingsTeamHandler(sessionRepo, userRepo, orgRepo))
+	r.Get("/settings/team", settingsTeamHandler(sessionRepo, userRepo, orgRepo, orgSvc))
+	r.Get("/settings/team/{id}/edit", settingsTeamEditModalHandler(sessionRepo, userRepo, orgRepo, orgSvc))
+	r.Patch("/settings/team/{id}", settingsTeamUpdateRoleHandler(sessionRepo, userRepo, orgRepo, orgSvc))
+	r.Delete("/settings/team/{id}", settingsTeamRemoveHandler(sessionRepo, userRepo, orgRepo, orgSvc))
 
 	// POPKins - Chain deployment platform (separate product)
 	// In production: popkins.popsigner.com
@@ -340,9 +361,9 @@ func main() {
 
 	// OAuth routes - using the service
 	r.Get("/auth/github", oauthRedirectHandler(oauthSvc, "github"))
-	r.Get("/auth/github/callback", oauthCallbackHandler(oauthSvc, "github", cfg))
+	r.Get("/auth/github/callback", oauthCallbackHandler(oauthSvc, "github", cfg, orgRepo))
 	r.Get("/auth/google", oauthRedirectHandler(oauthSvc, "google"))
-	r.Get("/auth/google/callback", oauthCallbackHandler(oauthSvc, "google", cfg))
+	r.Get("/auth/google/callback", oauthCallbackHandler(oauthSvc, "google", cfg, orgRepo))
 
 	// API v1 routes
 	r.Route("/v1", func(r chi.Router) {
@@ -495,7 +516,12 @@ func signupPageHandler() http.HandlerFunc {
 func oauthRedirectHandler(oauthSvc service.OAuthService, provider string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Generate a random state for CSRF protection
-		state := fmt.Sprintf("%d", time.Now().UnixNano())
+		state, err := newOAuthState()
+		if err != nil {
+			slog.Error("Failed to generate OAuth state", slog.String("error", err.Error()))
+			http.Redirect(w, r, "/login?error="+url.QueryEscape("Login unavailable, please try again"), http.StatusFound)
+			return
+		}
 
 		authURL, err := oauthSvc.GetAuthURL(provider, state)
 		if err != nil {
@@ -509,7 +535,8 @@ func oauthRedirectHandler(oauthSvc service.OAuthService, provider string) http.H
 			Name:     "oauth_state",
 			Value:    state,
 			Path:     "/",
-			MaxAge:   300, // 5 minutes
+			Domain:   cookieDomain, // The callback lands on the main host even for POPKins logins
+			MaxAge:   300,          // 5 minutes
 			HttpOnly: true,
 			Secure:   true,
 			SameSite: http.SameSiteLaxMode,
@@ -522,10 +549,12 @@ func oauthRedirectHandler(oauthSvc service.OAuthService, provider string) http.H
 			// Check if coming from POPKins subdomain
 			host := strings.ToLower(r.Host)
 			if strings.HasPrefix(host, "popkins.") {
-				returnTo = "https://popkins.popsigner.com/deployments"
+				returnTo = popkinsReturnTo(host)
 			} else {
 				returnTo = "/dashboard"
 			}
+		} else {
+			returnTo = safeReturnTo(returnTo)
 		}
 
 		// Set cookie domain to share across all subdomains
@@ -546,7 +575,7 @@ func oauthRedirectHandler(oauthSvc service.OAuthService, provider string) http.H
 }
 
 // oauthCallbackHandler handles the OAuth callback from the provider.
-func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *config.Config) http.HandlerFunc {
+func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *config.Config, orgRepo repository.OrgRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")
 		if code == "" {
@@ -555,8 +584,12 @@ func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *c
 			return
 		}
 
-		// TODO: Verify state parameter matches cookie for CSRF protection
-		// For now, we'll skip this for simplicity
+		stateCookie, err := r.Cookie("oauth_state")
+		if err != nil || !stateMatches(stateCookie.Value, r.URL.Query().Get("state")) {
+			slog.Warn("OAuth callback state mismatch", slog.String("provider", provider))
+			http.Redirect(w, r, "/login?error="+url.QueryEscape("Login expired, please try again"), http.StatusFound)
+			return
+		}
 
 		// Handle the OAuth callback - this exchanges code for token, fetches user info, creates/finds user, creates session
 		user, sessionID, err := oauthSvc.HandleCallback(r.Context(), provider, code)
@@ -565,7 +598,12 @@ func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *c
 				slog.String("provider", provider),
 				slog.String("error", err.Error()),
 			)
-			http.Redirect(w, r, "/login?error="+url.QueryEscape("Authentication failed: "+err.Error()), http.StatusFound)
+			// Provider and database errors are logged above; none of their text belongs in a URL.
+			message := "Authentication failed, please try again"
+			if errors.Is(err, service.ErrEmailNotAllowed) {
+				message = notAllowedLoginError
+			}
+			http.Redirect(w, r, "/login?error="+url.QueryEscape(message), http.StatusFound)
 			return
 		}
 
@@ -574,6 +612,14 @@ func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *c
 			slog.String("user_id", user.ID.String()),
 			slog.String("email", user.Email),
 		)
+
+		if orgAccess.enabled() {
+			if _, err := joinSharedOrg(r.Context(), user, orgRepo); err != nil {
+				slog.Error("Failed to join shared organization", slog.String("user_id", user.ID.String()), slog.String("error", err.Error()))
+				http.Redirect(w, r, "/login?error="+url.QueryEscape("Could not join the organization, please try again"), http.StatusFound)
+				return
+			}
+		}
 
 		// Set the session cookie (domain shared across all subdomains)
 		http.SetCookie(w, &http.Cookie{
@@ -592,19 +638,17 @@ func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *c
 			Name:   "oauth_state",
 			Value:  "",
 			Path:   "/",
+			Domain: cookieDomain,
 			MaxAge: -1,
 		})
 
 		// Get return URL from cookie (set during OAuth redirect)
 		returnTo := "/dashboard" // default for main dashboard
 		if cookie, err := r.Cookie("oauth_return_to"); err == nil && cookie.Value != "" {
-			returnTo = cookie.Value
-		} else {
+			returnTo = safeReturnTo(cookie.Value)
+		} else if referer, err := url.Parse(r.Header.Get("Referer")); err == nil && strings.HasPrefix(strings.ToLower(referer.Host), "popkins.") {
 			// If no cookie, check Referer header for subdomain hint
-			referer := r.Header.Get("Referer")
-			if strings.Contains(referer, "popkins.") {
-				returnTo = "https://popkins.popsigner.com/deployments"
-			}
+			returnTo = popkinsReturnTo(strings.ToLower(referer.Host))
 		}
 
 		// Clear the return URL cookie (must match domain used when setting)
@@ -624,46 +668,8 @@ func oauthCallbackHandler(oauthSvc service.OAuthService, provider string, cfg *c
 // dashboardHandler serves the dashboard page for authenticated users.
 func dashboardHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, orgRepo repository.OrgRepository, keyRepo repository.KeyRepository, auditRepo repository.AuditRepository, usageRepo repository.UsageRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get session cookie
-		cookie, err := r.Cookie(sessionCookieName)
-		if err != nil {
-			http.Redirect(w, r, "/login", http.StatusFound)
-			return
-		}
-
-		// Validate session
-		session, err := sessionRepo.Get(r.Context(), cookie.Value)
-		if err != nil || session == nil {
-			// Invalid or expired session
-			http.SetCookie(w, &http.Cookie{
-				Name:   sessionCookieName,
-				Value:  "",
-				Path:   "/",
-				Domain: cookieDomain,
-				MaxAge: -1,
-			})
-			http.Redirect(w, r, "/login", http.StatusFound)
-			return
-		}
-
-		// Check if session is expired
-		if session.ExpiresAt.Before(time.Now()) {
-			_ = sessionRepo.Delete(r.Context(), cookie.Value)
-			http.SetCookie(w, &http.Cookie{
-				Name:   sessionCookieName,
-				Value:  "",
-				Path:   "/",
-				Domain: cookieDomain,
-				MaxAge: -1,
-			})
-			http.Redirect(w, r, "/login?error="+url.QueryEscape("Session expired"), http.StatusFound)
-			return
-		}
-
-		// Get user info
-		user, err := userRepo.GetByID(r.Context(), session.UserID)
-		if err != nil || user == nil {
-			http.Redirect(w, r, "/login", http.StatusFound)
+		user := getAuthenticatedUser(w, r, sessionRepo, userRepo)
+		if user == nil {
 			return
 		}
 
@@ -671,16 +677,14 @@ func dashboardHandler(sessionRepo repository.SessionRepository, userRepo reposit
 		keyCount := 0
 		signatureLimit := 1000 // Default free tier
 		var orgID uuid.UUID
-		orgs, err := orgRepo.ListUserOrgs(r.Context(), user.ID)
-		if err == nil && len(orgs) > 0 {
-			orgID = orgs[0].ID
-			// Get keys for the first org
+		if org, err := ensureUserHasOrg(r.Context(), user, orgRepo); err == nil && org != nil {
+			orgID = org.ID
 			keys, err := keyRepo.ListByOrg(r.Context(), orgID)
 			if err == nil {
 				keyCount = len(keys)
 			}
 			// Get plan limits
-			limits := models.PlanLimitsMap[orgs[0].Plan]
+			limits := models.PlanLimitsMap[org.Plan]
 			signatureLimit = int(limits.SignaturesPerMonth)
 		}
 
@@ -761,6 +765,22 @@ func getAuthenticatedUser(w http.ResponseWriter, r *http.Request, sessionRepo re
 	user, err := userRepo.GetByID(r.Context(), session.UserID)
 	if err != nil || user == nil {
 		http.Redirect(w, r, "/login", http.StatusFound)
+		return nil
+	}
+
+	// Re-check the allowlist so removing an address revokes existing sessions on their next request.
+	if !loginPolicy.Allows(user.Email) {
+		if err := sessionRepo.Delete(r.Context(), cookie.Value); err != nil {
+			slog.Warn("Failed to delete revoked session", slog.String("user_id", user.ID.String()), slog.String("error", err.Error()))
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:   sessionCookieName,
+			Value:  "",
+			Path:   "/",
+			Domain: cookieDomain,
+			MaxAge: -1,
+		})
+		http.Redirect(w, r, "/login?error="+url.QueryEscape(notAllowedLoginError), http.StatusFound)
 		return nil
 	}
 
@@ -885,6 +905,9 @@ func keysCreateHandler(sessionRepo repository.SessionRepository, userRepo reposi
 			w.Write([]byte(`<div class="p-4 bg-red-500/20 border border-red-500/50 rounded-xl text-red-400">Failed to get organization</div>`))
 			return
 		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleOperator) {
+			return
+		}
 
 		// Get default namespace
 		namespaces, _ := orgRepo.ListNamespaces(r.Context(), org.ID)
@@ -933,7 +956,7 @@ func keysCreateHandler(sessionRepo repository.SessionRepository, userRepo reposi
 }
 
 // keyViewHandler displays the details of a specific key.
-func keyViewHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, keyRepo repository.KeyRepository) http.HandlerFunc {
+func keyViewHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, orgRepo repository.OrgRepository, keySvc service.KeyService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := getAuthenticatedUser(w, r, sessionRepo, userRepo)
 		if user == nil {
@@ -952,13 +975,21 @@ func keyViewHandler(sessionRepo repository.SessionRepository, userRepo repositor
 			return
 		}
 
-		key, err := keyRepo.GetByID(r.Context(), keyUUID)
+		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
+		if err != nil || org == nil {
+			writeOrgError(w, err)
+			return
+		}
+
+		key, err := keySvc.Get(r.Context(), org.ID, keyUUID)
 		if err != nil || key == nil {
 			http.Error(w, "Key not found", http.StatusNotFound)
 			return
 		}
 
 		dashData := buildDashboardData(user, "/keys")
+		dashData.OrgName = org.Name
+		dashData.OrgPlan = string(org.Plan)
 
 		// Generate Celestia address from the key's hex address
 		celestiaAddr := deriveCelestiaAddress(key.Address)
@@ -994,7 +1025,7 @@ func keyViewHandler(sessionRepo repository.SessionRepository, userRepo repositor
 }
 
 // keySignHandler handles signing a test message with a key.
-func keySignHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, keyRepo repository.KeyRepository, keySvc service.KeyService) http.HandlerFunc {
+func keySignHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, orgRepo repository.OrgRepository, keySvc service.KeyService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := getAuthenticatedUser(w, r, sessionRepo, userRepo)
 		if user == nil {
@@ -1013,7 +1044,16 @@ func keySignHandler(sessionRepo repository.SessionRepository, userRepo repositor
 			return
 		}
 
-		key, err := keyRepo.GetByID(r.Context(), keyUUID)
+		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
+		if err != nil || org == nil {
+			writeOrgError(w, err)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleOperator) {
+			return
+		}
+
+		key, err := keySvc.Get(r.Context(), org.ID, keyUUID)
 		if err != nil || key == nil {
 			http.Error(w, "Key not found", http.StatusNotFound)
 			return
@@ -1031,7 +1071,7 @@ func keySignHandler(sessionRepo repository.SessionRepository, userRepo repositor
 		}
 
 		// Sign the message using KeyService (orgID, keyID, data, prehashed)
-		signResp, err := keySvc.Sign(r.Context(), key.OrgID, key.ID, []byte(message), false)
+		signResp, err := keySvc.Sign(r.Context(), org.ID, key.ID, []byte(message), false)
 		if err != nil {
 			slog.Error("Failed to sign message", slog.String("error", err.Error()))
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1086,14 +1126,17 @@ func keyDeleteHandler(sessionRepo repository.SessionRepository, userRepo reposit
 			return
 		}
 
-		key, err := keyRepo.GetByID(r.Context(), keyUUID)
-		if err != nil || key == nil {
-			http.Error(w, "Key not found", http.StatusNotFound)
+		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
+		if err != nil || org == nil {
+			writeOrgError(w, err)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
-		// Delete the key via KeyService
-		if err := keySvc.Delete(r.Context(), key.OrgID, key.ID); err != nil {
+		// Delete the key via KeyService, which refuses keys outside org
+		if err := keySvc.Delete(r.Context(), org.ID, keyUUID); err != nil {
 			slog.Error("Failed to delete key", slog.String("error", err.Error()))
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Write([]byte(fmt.Sprintf(`<div class="fixed bottom-4 right-4 z-50 flex items-center gap-3 px-4 py-3 bg-black border border-[#FF3333] text-[#FF3333] min-w-[200px] font-mono uppercase" x-data="{ show: true }" x-show="show" x-init="setTimeout(() => { show = false; setTimeout(() => $el.remove(), 200) }, 5000)" x-transition><span>✗</span><span class="text-sm font-medium">%s</span></div>`, err.Error())))
@@ -1105,22 +1148,13 @@ func keyDeleteHandler(sessionRepo repository.SessionRepository, userRepo reposit
 			slog.String("key_id", keyID),
 		)
 
-		// Get org for the keys list
-		org, _ := ensureUserHasOrg(r.Context(), user, orgRepo)
-
 		dashData := buildDashboardData(user, "/keys")
-		if org != nil {
-			dashData.OrgName = org.Name
-			dashData.OrgPlan = string(org.Plan)
-		}
+		dashData.OrgName = org.Name
+		dashData.OrgPlan = string(org.Plan)
 
 		// Fetch updated keys and namespaces
-		var keys []*models.Key
-		var namespaces []*models.Namespace
-		if org != nil {
-			keys, _ = keyRepo.ListByOrg(r.Context(), org.ID)
-			namespaces, _ = orgRepo.ListNamespaces(r.Context(), org.ID)
-		}
+		keys, _ := keyRepo.ListByOrg(r.Context(), org.ID)
+		namespaces, _ := orgRepo.ListNamespaces(r.Context(), org.ID)
 
 		data := pages.KeysPageData{
 			UserName:   dashData.UserName,
@@ -1149,7 +1183,7 @@ func settingsAPIKeysHandler(sessionRepo repository.SessionRepository, userRepo r
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
 			slog.Error("Failed to get/create org for API keys page", slog.String("error", err.Error()))
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
@@ -1199,9 +1233,12 @@ func settingsAPIKeysNewHandler(sessionRepo repository.SessionRepository, userRep
 		}
 
 		// Verify user has an org
-		_, err := ensureUserHasOrg(r.Context(), user, orgRepo)
-		if err != nil {
+		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
+		if err != nil || org == nil {
 			http.Error(w, "Session expired or no organization", http.StatusUnauthorized)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
@@ -1223,6 +1260,9 @@ func settingsAPIKeysCreateHandler(sessionRepo repository.SessionRepository, user
 		if err != nil || org == nil {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			pages.APIKeyCreateError("No organization found. Please refresh and try again.").Render(r.Context(), w)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
@@ -1284,6 +1324,9 @@ func settingsAPIKeysDeleteHandler(sessionRepo repository.SessionRepository, user
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
 			http.Error(w, "No organization found", http.StatusBadRequest)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
@@ -1388,7 +1431,7 @@ func settingsCertificatesHandler(sessionRepo repository.SessionRepository, userR
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
 			slog.Error("Failed to get/create org for certificates page", slog.String("error", err.Error()))
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
@@ -1435,9 +1478,12 @@ func settingsCertificatesNewHandler(sessionRepo repository.SessionRepository, us
 		}
 
 		// Verify user has an org
-		_, err := ensureUserHasOrg(r.Context(), user, orgRepo)
-		if err != nil {
+		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
+		if err != nil || org == nil {
 			http.Error(w, "Session expired or no organization", http.StatusUnauthorized)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
@@ -1459,6 +1505,9 @@ func settingsCertificatesCreateHandler(sessionRepo repository.SessionRepository,
 		if err != nil || org == nil {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			pages.CertificateCreateError("No organization found. Please refresh and try again.").Render(r.Context(), w)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
@@ -1526,6 +1575,9 @@ func settingsCertificatesRevokeHandler(sessionRepo repository.SessionRepository,
 			http.Error(w, "No organization found", http.StatusBadRequest)
 			return
 		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
+			return
+		}
 
 		certID := chi.URLParam(r, "id")
 		if certID == "" {
@@ -1569,6 +1621,9 @@ func settingsCertificatesDeleteHandler(sessionRepo repository.SessionRepository,
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
 			http.Error(w, "No organization found", http.StatusBadRequest)
+			return
+		}
+		if !requireRole(w, r, orgRepo, org, user, models.RoleAdmin) {
 			return
 		}
 
@@ -1633,7 +1688,7 @@ func settingsCertificatesDownloadHandler(sessionRepo repository.SessionRepositor
 
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
@@ -1753,6 +1808,10 @@ func bech32Polymod(values []byte) int {
 // ensureUserHasOrg ensures the user has at least one organization.
 // If the user has no orgs, it creates a default "Personal" org.
 func ensureUserHasOrg(ctx context.Context, user *models.User, orgRepo repository.OrgRepository) (*models.Organization, error) {
+	if orgAccess.enabled() {
+		return sharedOrgFor(ctx, user, orgRepo)
+	}
+
 	// Check if user already has orgs
 	orgs, err := orgRepo.ListUserOrgs(ctx, user.ID)
 	if err != nil {
@@ -1849,7 +1908,7 @@ func usageHandler(sessionRepo repository.SessionRepository, userRepo repository.
 		// Ensure user has an org
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
@@ -1927,7 +1986,7 @@ func auditHandler(sessionRepo repository.SessionRepository, userRepo repository.
 		// Ensure user has an org
 		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
 		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
+			writeOrgError(w, err)
 			return
 		}
 
@@ -2124,69 +2183,4 @@ func createHostRouter(dashboardRouter http.Handler, popkinsRouter http.Handler, 
 			dashboardRouter.ServeHTTP(w, r)
 		}
 	})
-}
-
-// settingsTeamHandler serves the team settings page.
-func settingsTeamHandler(sessionRepo repository.SessionRepository, userRepo repository.UserRepository, orgRepo repository.OrgRepository) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		user := getAuthenticatedUser(w, r, sessionRepo, userRepo)
-		if user == nil {
-			return
-		}
-
-		// Ensure user has an org
-		org, err := ensureUserHasOrg(r.Context(), user, orgRepo)
-		if err != nil || org == nil {
-			http.Error(w, "Failed to get organization", http.StatusInternalServerError)
-			return
-		}
-
-		dashData := buildDashboardData(user, "/settings/team")
-		dashData.OrgName = org.Name
-		dashData.OrgPlan = string(org.Plan)
-
-		// Get plan limits
-		limits := models.GetPlanLimits(org.Plan)
-
-		// Get current user as the only member (simplified - full team management requires OrgService)
-		userName := ""
-		if user.Name != nil {
-			userName = *user.Name
-		}
-		avatarURL := ""
-		if user.AvatarURL != nil {
-			avatarURL = *user.AvatarURL
-		}
-
-		members := []*pages.TeamMemberDisplay{
-			{
-				ID:            user.ID,
-				Name:          userName,
-				Email:         user.Email,
-				AvatarURL:     avatarURL,
-				Role:          models.RoleOwner,
-				JoinedAt:      user.CreatedAt.Format("Jan 2, 2006"),
-				IsCurrentUser: true,
-			},
-		}
-
-		data := pages.TeamPageData{
-			DashboardData: layouts.DashboardData{
-				UserName:   dashData.UserName,
-				UserEmail:  dashData.UserEmail,
-				AvatarURL:  dashData.AvatarURL,
-				OrgName:    dashData.OrgName,
-				OrgPlan:    dashData.OrgPlan,
-				ActivePath: "/settings/team",
-			},
-			Members:     members,
-			Invitations: nil,
-			CurrentRole: models.RoleOwner,
-			MemberLimit: limits.TeamMembers,
-			MemberCount: 1,
-		}
-
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		pages.SettingsTeamPage(data).Render(r.Context(), w)
-	}
 }

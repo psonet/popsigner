@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -46,6 +47,7 @@ type oauthService struct {
 	sessionRepo    repository.SessionRepository
 	sessionExpiry  time.Duration
 	httpClient     HTTPClient
+	policy         *LoginPolicy
 }
 
 // HTTPClient interface for making HTTP requests (allows mocking in tests).
@@ -92,6 +94,7 @@ func NewOAuthService(
 		sessionRepo:   sessionRepo,
 		sessionExpiry: cfg.SessionExpiry,
 		httpClient:    http.DefaultClient,
+		policy:        NewLoginPolicy(cfg.AllowedEmailDomains, cfg.AllowedEmails),
 	}
 }
 
@@ -134,6 +137,10 @@ func (s *oauthService) HandleCallback(ctx context.Context, provider, code string
 		return nil, "", fmt.Errorf("failed to fetch user info: %w", err)
 	}
 
+	if err := s.admit(userInfo); err != nil {
+		return nil, "", err
+	}
+
 	// Find or create user
 	user, err := s.findOrCreateUser(ctx, provider, userInfo)
 	if err != nil {
@@ -150,6 +157,14 @@ func (s *oauthService) HandleCallback(ctx context.Context, provider, code string
 	_ = s.userRepo.UpdateLastLogin(ctx, user.ID)
 
 	return user, sessionID, nil
+}
+
+// admit enforces the login allowlist before any user record is created or linked.
+func (s *oauthService) admit(info *OAuthUserInfo) error {
+	if !s.policy.Allows(info.Email) {
+		return ErrEmailNotAllowed
+	}
+	return nil
 }
 
 func (s *oauthService) GetSupportedProviders() []string {
@@ -261,14 +276,24 @@ func (s *oauthService) fetchGoogleUser(client *http.Client) (*OAuthUserInfo, err
 		return nil, fmt.Errorf("google API returned status %d", resp.StatusCode)
 	}
 
+	return parseGoogleUser(resp.Body)
+}
+
+// parseGoogleUser decodes a Google userinfo response. Unverified addresses are rejected
+// because the allowlist matches on the email domain.
+func parseGoogleUser(body io.Reader) (*OAuthUserInfo, error) {
 	var data struct {
-		ID      string `json:"id"`
-		Email   string `json:"email"`
-		Name    string `json:"name"`
-		Picture string `json:"picture"`
+		ID            string `json:"id"`
+		Email         string `json:"email"`
+		VerifiedEmail bool   `json:"verified_email"`
+		Name          string `json:"name"`
+		Picture       string `json:"picture"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+	if err := json.NewDecoder(body).Decode(&data); err != nil {
 		return nil, fmt.Errorf("failed to decode Google user response: %w", err)
+	}
+	if !data.VerifiedEmail {
+		return nil, fmt.Errorf("google account email is not verified")
 	}
 
 	return &OAuthUserInfo{

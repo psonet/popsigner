@@ -838,7 +838,8 @@ func canInvite(role models.Role) bool {
 }
 
 func canManageMember(currentRole, memberRole models.Role) bool {
-	return models.RoleLevel(currentRole) > models.RoleLevel(memberRole)
+	return models.RoleLevel(currentRole) >= models.RoleLevel(models.RoleAdmin) &&
+		models.RoleLevel(currentRole) > models.RoleLevel(memberRole)
 }
 
 func formatLimit(limit int) string {

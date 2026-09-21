@@ -99,6 +99,11 @@ func (h *Handler) RequireAuth(next http.Handler) http.Handler {
 			h.handleAuthError(w, r)
 			return
 		}
+		if !h.loginPolicy.Allows(user.Email) {
+			h.revokeSession(r.Context(), cookie.Value, user)
+			h.handleAuthError(w, r)
+			return
+		}
 
 		// Add user info to context
 		ctx := context.WithValue(r.Context(), ContextKeyUser, user)

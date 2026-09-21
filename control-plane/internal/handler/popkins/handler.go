@@ -53,9 +53,15 @@ type Handler struct {
 	orchestrator Orchestrator
 	sessionRepo  mainrepo.SessionRepository
 	userRepo     mainrepo.UserRepository
+	loginPolicy  *service.LoginPolicy
+	resolveOrg   OrgResolver
 }
 
-// NewHandler creates a new POPKins handler.
+// OrgResolver returns the organization a signed-in user acts in, or an error when they have none.
+type OrgResolver func(ctx context.Context, user *models.User) (*models.Organization, error)
+
+// NewHandler creates a new POPKins handler. loginPolicy may be nil (no login restriction);
+// resolveOrg may be nil, in which case the user's oldest organization is used.
 func NewHandler(
 	authService service.AuthService,
 	orgService service.OrgService,
@@ -64,6 +70,8 @@ func NewHandler(
 	orchestrator Orchestrator,
 	sessionRepo mainrepo.SessionRepository,
 	userRepo mainrepo.UserRepository,
+	loginPolicy *service.LoginPolicy,
+	resolveOrg OrgResolver,
 ) *Handler {
 	return &Handler{
 		authService:  authService,
@@ -73,6 +81,8 @@ func NewHandler(
 		orchestrator: orchestrator,
 		sessionRepo:  sessionRepo,
 		userRepo:     userRepo,
+		loginPolicy:  loginPolicy,
+		resolveOrg:   resolveOrg,
 	}
 }
 
@@ -291,7 +301,10 @@ func (h *Handler) DeploymentsCreate(w http.ResponseWriter, r *http.Request) {
 		h.handleAuthError(w, r)
 		return
 	}
-	_ = user // user context available for audit logging
+	if err := h.orgService.CheckAccess(r.Context(), org.ID, user.ID, models.RoleOperator); err != nil {
+		http.Redirect(w, r, "/deployments/new?step=4&error=Your+role+cannot+create+deployments", http.StatusFound)
+		return
+	}
 
 	if err := r.ParseForm(); err != nil {
 		http.Redirect(w, r, "/deployments/new?step=4&error=Invalid+form+data", http.StatusFound)
@@ -479,6 +492,10 @@ func (h *Handler) CreateKeyInline(w http.ResponseWriter, r *http.Request) {
 	user, org, err := h.getUserAndOrg(r)
 	if err != nil {
 		h.handleAuthError(w, r)
+		return
+	}
+	if err := h.orgService.CheckAccess(r.Context(), org.ID, user.ID, models.RoleOperator); err != nil {
+		http.Redirect(w, r, "/deployments/new?step=3&error=Your+role+cannot+create+keys", http.StatusFound)
 		return
 	}
 
@@ -1574,6 +1591,18 @@ func (h *Handler) getUserAndOrg(r *http.Request) (*models.User, *models.Organiza
 	if err != nil || user == nil {
 		return nil, nil, errors.New("user not found")
 	}
+	if !h.loginPolicy.Allows(user.Email) {
+		h.revokeSession(r.Context(), cookie.Value, user)
+		return nil, nil, errors.New("user is no longer allowed to sign in")
+	}
+
+	if h.resolveOrg != nil {
+		org, err := h.resolveOrg(r.Context(), user)
+		if err != nil || org == nil {
+			return nil, nil, fmt.Errorf("resolve organization: %w", err)
+		}
+		return user, org, nil
+	}
 
 	// Get first org for user
 	var org *models.Organization
@@ -1587,6 +1616,13 @@ func (h *Handler) getUserAndOrg(r *http.Request) (*models.User, *models.Organiza
 	}
 
 	return user, org, nil
+}
+
+// revokeSession ends a session whose user is no longer allowed to sign in.
+func (h *Handler) revokeSession(ctx context.Context, sessionID string, user *models.User) {
+	if err := h.sessionRepo.Delete(ctx, sessionID); err != nil {
+		slog.Warn("failed to delete revoked session", "user_id", user.ID, "error", err)
+	}
 }
 
 // handleAuthError handles authentication errors by redirecting to login.
