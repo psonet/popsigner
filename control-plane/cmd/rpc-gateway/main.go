@@ -97,7 +97,7 @@ func main() {
 	usageRepo := repository.NewUsageRepository(db.Pool())
 
 	// Initialize services
-	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
+	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, keyRepo)
 
 	// Create JSON-RPC server
 	rpcServer := jsonrpc.NewServer(jsonrpc.ServerConfig{

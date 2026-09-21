@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"sync"
 
 	"github.com/google/uuid"
@@ -23,9 +24,10 @@ type BaoKeyringInterface interface {
 	// Returns the public key bytes, address, and Ethereum address.
 	NewAccountWithOptions(uid string, opts KeyOptions) (pubKey []byte, address string, ethAddress string, err error)
 
-	// Sign signs a message with the given key.
+	// Sign signs a message with the given key. When prehashed is true, msg is
+	// a 32-byte digest the engine must sign as-is rather than hash again.
 	// Returns the signature and public key.
-	Sign(uid string, msg []byte) (signature []byte, pubKey []byte, err error)
+	Sign(uid string, msg []byte, prehashed bool) (signature []byte, pubKey []byte, err error)
 
 	// Delete removes a key from OpenBao.
 	Delete(uid string) error
@@ -293,7 +295,7 @@ func (s *keyService) Get(ctx context.Context, orgID, keyID uuid.UUID) (*models.K
 	if err != nil {
 		return nil, fmt.Errorf("failed to get key: %w", err)
 	}
-	if key == nil || key.OrgID != orgID || key.DeletedAt != nil {
+	if key == nil || key.OrgID != orgID || key.DeletedAt != nil || !AllowsKey(ctx, keyID) {
 		return nil, apierrors.NewNotFoundError("Key")
 	}
 	return key, nil
@@ -322,6 +324,17 @@ func (s *keyService) List(ctx context.Context, orgID uuid.UUID, namespaceID *uui
 		return nil, fmt.Errorf("failed to list keys: %w", err)
 	}
 
+	// Restrict to the keys the calling credential is bound to
+	if identity, ok := APIKeyIdentityFromContext(ctx); ok && len(identity.AllowedKeyIDs) > 0 {
+		allowed := make([]*models.Key, 0, len(keys))
+		for _, k := range keys {
+			if AllowsKey(ctx, k.ID) {
+				allowed = append(allowed, k)
+			}
+		}
+		keys = allowed
+	}
+
 	// Filter by network type if specified
 	if networkType != nil && *networkType != models.NetworkTypeAll {
 		filtered := make([]*models.Key, 0, len(keys))
@@ -342,7 +355,7 @@ func (s *keyService) Delete(ctx context.Context, orgID, keyID uuid.UUID) error {
 	if err != nil {
 		return fmt.Errorf("failed to get key: %w", err)
 	}
-	if key == nil || key.OrgID != orgID {
+	if key == nil || key.OrgID != orgID || !AllowsKey(ctx, keyID) {
 		return apierrors.NewNotFoundError("Key")
 	}
 
@@ -371,7 +384,7 @@ func (s *keyService) Sign(ctx context.Context, orgID, keyID uuid.UUID, data []by
 	if err != nil {
 		return nil, apierrors.NewInternalError(fmt.Sprintf("failed to get key: %v", err))
 	}
-	if key == nil || key.OrgID != orgID || key.DeletedAt != nil {
+	if key == nil || key.OrgID != orgID || key.DeletedAt != nil || !AllowsKey(ctx, keyID) {
 		return nil, apierrors.NewNotFoundError("Key")
 	}
 
@@ -381,7 +394,7 @@ func (s *keyService) Sign(ctx context.Context, orgID, keyID uuid.UUID, data []by
 	}
 
 	// Sign via BaoKeyring
-	sig, pubKey, err := s.baoKeyring.Sign(key.BaoKeyPath, data)
+	sig, pubKey, err := s.baoKeyring.Sign(key.BaoKeyPath, data, prehashed)
 	if err != nil {
 		return nil, apierrors.NewInternalError(fmt.Sprintf("signing failed: %v", err))
 	}
@@ -401,6 +414,13 @@ func (s *keyService) Sign(ctx context.Context, orgID, keyID uuid.UUID, data []by
 
 // SignBatch signs multiple messages in parallel.
 func (s *keyService) SignBatch(ctx context.Context, req SignBatchKeyRequest) ([]*SignKeyResponse, error) {
+	// Reject the whole batch before signing anything if it reaches beyond the binding
+	for _, signReq := range req.Requests {
+		if !AllowsKey(ctx, signReq.KeyID) {
+			return nil, apierrors.ErrForbidden.WithMessage("API key is not allowed to use every key in this batch")
+		}
+	}
+
 	// Check quota for all signatures
 	if err := s.checkSignatureQuota(ctx, req.OrgID); err != nil {
 		return nil, err
@@ -491,7 +511,7 @@ func (s *keyService) Export(ctx context.Context, orgID, keyID uuid.UUID) (string
 	if err != nil {
 		return "", fmt.Errorf("failed to get key: %w", err)
 	}
-	if key == nil || key.OrgID != orgID || key.DeletedAt != nil {
+	if key == nil || key.OrgID != orgID || key.DeletedAt != nil || !AllowsKey(ctx, keyID) {
 		return "", apierrors.NewNotFoundError("Key")
 	}
 
@@ -575,15 +595,28 @@ func (s *keyService) incrementUsage(ctx context.Context, orgID uuid.UUID, metric
 }
 
 func (s *keyService) auditLog(ctx context.Context, orgID uuid.UUID, event models.AuditEvent, resourceType models.ResourceType, resourceID uuid.UUID) {
+	entry := &models.AuditLog{
+		OrgID:        orgID,
+		Event:        event,
+		ActorType:    models.ActorTypeAPIKey, // Default to API key, can be overridden
+		ResourceType: &resourceType,
+		ResourceID:   &resourceID,
+	}
+	// Read the caller off the context before the goroutine outlives the request
+	if identity, ok := APIKeyIdentityFromContext(ctx); ok {
+		keyID := identity.KeyID
+		entry.ActorID = &keyID
+		if ip := net.ParseIP(identity.IPAddress); ip != nil {
+			entry.IPAddress = &ip
+		}
+		if identity.UserAgent != "" {
+			entry.UserAgent = &identity.UserAgent
+		}
+	}
+
 	// Run asynchronously to not block the request
 	go func() {
-		_ = s.auditRepo.Create(context.Background(), &models.AuditLog{
-			OrgID:        orgID,
-			Event:        event,
-			ActorType:    models.ActorTypeAPIKey, // Default to API key, can be overridden
-			ResourceType: &resourceType,
-			ResourceID:   &resourceID,
-		})
+		_ = s.auditRepo.Create(context.Background(), entry)
 	}()
 }
 

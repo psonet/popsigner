@@ -76,6 +76,9 @@ func (h *SignBlockPayloadHandler) Handle(ctx context.Context, params json.RawMes
 	if orgID.String() == "00000000-0000-0000-0000-000000000000" {
 		return nil, ErrUnauthorized("missing organization context")
 	}
+	if scopeErr := requireScope(ctx, scopeKeysSign); scopeErr != nil {
+		return nil, scopeErr
+	}
 
 	// Parse arguments
 	var args []BlockPayloadArgs
@@ -115,12 +118,9 @@ func (h *SignBlockPayloadHandler) Handle(ctx context.Context, params json.RawMes
 
 	// Lookup key by sender address
 	senderAddr := arg.SenderAddress.Hex()
-	key, err := h.keyRepo.GetByEthAddress(ctx, orgID, senderAddr)
-	if err != nil {
-		return nil, ErrInternal(fmt.Sprintf("failed to lookup key: %v", err))
-	}
-	if key == nil {
-		return nil, ErrResourceNotFound(fmt.Sprintf("no key found for address %s", senderAddr))
+	key, keyErr := resolveKey(ctx, h.keyRepo, orgID, senderAddr)
+	if keyErr != nil {
+		return nil, keyErr
 	}
 
 	// Sign via OpenBao (use chainID=0 for raw yParity)
@@ -145,6 +145,9 @@ func (h *SignBlockPayloadHandler) HandleV2(ctx context.Context, params json.RawM
 	orgID := middleware.GetOrgIDFromContext(ctx)
 	if orgID.String() == "00000000-0000-0000-0000-000000000000" {
 		return nil, ErrUnauthorized("missing organization context")
+	}
+	if scopeErr := requireScope(ctx, scopeKeysSign); scopeErr != nil {
+		return nil, scopeErr
 	}
 
 	// Parse V2 arguments
@@ -181,12 +184,9 @@ func (h *SignBlockPayloadHandler) HandleV2(ctx context.Context, params json.RawM
 
 	// Lookup key by sender address
 	senderAddr := arg.SenderAddress.Hex()
-	key, err := h.keyRepo.GetByEthAddress(ctx, orgID, senderAddr)
-	if err != nil {
-		return nil, ErrInternal(fmt.Sprintf("failed to lookup key: %v", err))
-	}
-	if key == nil {
-		return nil, ErrResourceNotFound(fmt.Sprintf("no key found for address %s", senderAddr))
+	key, keyErr := resolveKey(ctx, h.keyRepo, orgID, senderAddr)
+	if keyErr != nil {
+		return nil, keyErr
 	}
 
 	// Sign via OpenBao

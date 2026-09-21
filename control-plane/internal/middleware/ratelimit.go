@@ -2,9 +2,12 @@ package middleware
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,19 +35,21 @@ func DefaultRateLimitConfig() RateLimitConfig {
 func RateLimit(redis *database.Redis, cfg RateLimitConfig) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Get client identifier (IP or API key)
-			clientID := getClientID(r)
-			key := fmt.Sprintf("ratelimit:%s", clientID)
-
 			ctx := r.Context()
 			windowDuration := time.Minute
 
-			// Increment counter and get current value
-			count, err := redis.IncrWithExpire(ctx, key, windowDuration)
-			if err != nil {
-				// On Redis error, allow the request but log the error
-				next.ServeHTTP(w, r)
-				return
+			// Count the request against every bucket it belongs to
+			var count int64
+			for _, bucket := range rateLimitBuckets(r) {
+				bucketCount, err := redis.IncrWithExpire(ctx, fmt.Sprintf("ratelimit:%s", bucket), windowDuration)
+				if err != nil {
+					// On Redis error, allow the request but log the error
+					next.ServeHTTP(w, r)
+					return
+				}
+				if bucketCount > count {
+					count = bucketCount
+				}
 			}
 
 			limit := cfg.RequestsPerMinute
@@ -73,15 +78,29 @@ func RateLimit(redis *database.Redis, cfg RateLimitConfig) func(next http.Handle
 	}
 }
 
+// rateLimitBuckets returns every bucket the request is counted against.
+// The limiter runs before authentication, so a presented credential adds a
+// bucket but never replaces the IP one: an unauthenticated flood of bogus
+// credentials must stay inside the IP budget.
+func rateLimitBuckets(r *http.Request) []string {
+	buckets := make([]string, 0, 2)
+	if credential := extractAPIKey(r); credential != "" {
+		buckets = append(buckets, credentialBucket(credential))
+	}
+	return append(buckets, "ip:"+getRealIP(r))
+}
+
+// credentialBucket identifies a credential without storing it.
+func credentialBucket(credential string) string {
+	digest := sha256.Sum256([]byte(credential))
+	return "apikey:" + hex.EncodeToString(digest[:16])
+}
+
 // getClientID extracts a unique identifier for the client.
 func getClientID(r *http.Request) string {
 	// Check for API key first
-	if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
-		// Use a hash prefix of the API key
-		if len(apiKey) > 20 {
-			return "apikey:" + apiKey[:20]
-		}
-		return "apikey:" + apiKey
+	if credential := extractAPIKey(r); credential != "" {
+		return credentialBucket(credential)
 	}
 
 	// Fall back to IP address
@@ -90,9 +109,12 @@ func getClientID(r *http.Request) string {
 
 // getRealIP extracts the real client IP, considering proxies.
 func getRealIP(r *http.Request) string {
-	// Check X-Forwarded-For header
+	// Check X-Forwarded-For header; the client is the first hop
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return xff
+		if hop, _, found := strings.Cut(xff, ","); found {
+			return strings.TrimSpace(hop)
+		}
+		return strings.TrimSpace(xff)
 	}
 
 	// Check X-Real-IP header
