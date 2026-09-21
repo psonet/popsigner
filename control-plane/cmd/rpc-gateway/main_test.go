@@ -225,8 +225,9 @@ func setupTestServer(t *testing.T) *httptest.Server {
 	orgID := uuid.New()
 	apiKeySvc := &mockAPIKeyService{
 		validKey: &models.APIKey{
-			ID:    uuid.New(),
-			OrgID: orgID,
+			ID:     uuid.New(),
+			OrgID:  orgID,
+			Scopes: []string{"keys:read", "keys:sign"},
 		},
 	}
 

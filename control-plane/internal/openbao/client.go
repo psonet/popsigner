@@ -250,13 +250,14 @@ func (c *Client) NewAccountWithOptions(uid string, opts service.KeyOptions) (pub
 	return pubKeyBytes, keyResp.Data.Address, ethAddr, nil
 }
 
-// Sign signs a message with the given key.
-func (c *Client) Sign(uid string, msg []byte) (signature []byte, pubKey []byte, err error) {
+// Sign signs a message with the given key. When prehashed is true, msg is a
+// 32-byte digest the engine signs as-is instead of hashing again.
+func (c *Client) Sign(uid string, msg []byte, prehashed bool) (signature []byte, pubKey []byte, err error) {
 	url := fmt.Sprintf("%s/v1/%s/sign/%s", c.address, c.mountPath, uid)
-	
+
 	body := map[string]interface{}{
 		"input":     base64.StdEncoding.EncodeToString(msg),
-		"prehashed": false,
+		"prehashed": prehashed,
 	}
 	
 	jsonBody, err := json.Marshal(body)

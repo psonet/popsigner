@@ -84,7 +84,7 @@ func (m *mockAPIKeyRepo) Delete(ctx context.Context, id uuid.UUID) error {
 
 func TestAPIKeyService_Create(t *testing.T) {
 	repo := newMockAPIKeyRepo()
-	svc := NewAPIKeyService(repo)
+	svc := NewAPIKeyService(repo, newMockKeyRepo())
 	ctx := context.Background()
 	orgID := uuid.New()
 
@@ -217,7 +217,7 @@ func TestAPIKeyService_Create(t *testing.T) {
 
 func TestAPIKeyService_Validate(t *testing.T) {
 	repo := newMockAPIKeyRepo()
-	svc := NewAPIKeyService(repo)
+	svc := NewAPIKeyService(repo, newMockKeyRepo())
 	ctx := context.Background()
 	orgID := uuid.New()
 
@@ -281,7 +281,7 @@ func TestAPIKeyService_Validate(t *testing.T) {
 
 func TestAPIKeyService_List(t *testing.T) {
 	repo := newMockAPIKeyRepo()
-	svc := NewAPIKeyService(repo)
+	svc := NewAPIKeyService(repo, newMockKeyRepo())
 	ctx := context.Background()
 	orgID := uuid.New()
 	otherOrgID := uuid.New()
@@ -334,7 +334,7 @@ func TestAPIKeyService_List(t *testing.T) {
 
 func TestAPIKeyService_Revoke(t *testing.T) {
 	repo := newMockAPIKeyRepo()
-	svc := NewAPIKeyService(repo)
+	svc := NewAPIKeyService(repo, newMockKeyRepo())
 	ctx := context.Background()
 	orgID := uuid.New()
 
@@ -382,7 +382,7 @@ func TestAPIKeyService_Revoke(t *testing.T) {
 
 func TestAPIKeyService_Delete(t *testing.T) {
 	repo := newMockAPIKeyRepo()
-	svc := NewAPIKeyService(repo)
+	svc := NewAPIKeyService(repo, newMockKeyRepo())
 	ctx := context.Background()
 	orgID := uuid.New()
 
@@ -508,3 +508,116 @@ func TestAPIKeyService_HashAndVerify(t *testing.T) {
 	})
 }
 
+func TestAPIKeyService_KeyBindings(t *testing.T) {
+	ctx := context.Background()
+
+	// setup returns a service whose org owns one signing key.
+	setup := func(t *testing.T) (*mockAPIKeyRepo, APIKeyService, uuid.UUID, *models.Key) {
+		t.Helper()
+		apiKeyRepo := newMockAPIKeyRepo()
+		signingKeys := newMockKeyRepo()
+		orgID := uuid.New()
+		signingKey := &models.Key{ID: uuid.New(), OrgID: orgID, Name: "node"}
+		if err := signingKeys.Create(ctx, signingKey); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		return apiKeyRepo, NewAPIKeyService(apiKeyRepo, signingKeys), orgID, signingKey
+	}
+
+	t.Run("binds to a key of the organization", func(t *testing.T) {
+		_, svc, orgID, signingKey := setup(t)
+		userID := uuid.New()
+
+		key, _, err := svc.Create(ctx, orgID, CreateAPIKeyRequest{
+			Name:          "Node",
+			Scopes:        []string{"keys:sign"},
+			AllowedKeyIDs: []uuid.UUID{signingKey.ID},
+			UserID:        &userID,
+		})
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		if !key.IsBound() {
+			t.Error("IsBound() = false, want true")
+		}
+		if len(key.AllowedKeyIDs) != 1 || key.AllowedKeyIDs[0] != signingKey.ID {
+			t.Errorf("AllowedKeyIDs = %v, want %v", key.AllowedKeyIDs, signingKey.ID)
+		}
+		if key.UserID == nil || *key.UserID != userID {
+			t.Errorf("UserID = %v, want %v", key.UserID, userID)
+		}
+	})
+
+	t.Run("rejects a key of another organization", func(t *testing.T) {
+		_, svc, orgID, _ := setup(t)
+
+		_, _, err := svc.Create(ctx, orgID, CreateAPIKeyRequest{
+			Name:          "Foreign",
+			Scopes:        []string{"keys:sign"},
+			AllowedKeyIDs: []uuid.UUID{uuid.New()},
+		})
+		if err == nil {
+			t.Fatal("Create() expected error for a key outside the organization")
+		}
+	})
+
+	t.Run("rejects a deleted key", func(t *testing.T) {
+		apiKeyRepo, svc, orgID, signingKey := setup(t)
+		deleted := time.Now()
+		signingKey.DeletedAt = &deleted
+
+		_, _, err := svc.Create(ctx, orgID, CreateAPIKeyRequest{
+			Name:          "Stale",
+			Scopes:        []string{"keys:sign"},
+			AllowedKeyIDs: []uuid.UUID{signingKey.ID},
+		})
+		if err == nil {
+			t.Fatal("Create() expected error for a deleted key")
+		}
+		if len(apiKeyRepo.keys) != 0 {
+			t.Errorf("stored %d API keys, want 0", len(apiKeyRepo.keys))
+		}
+	})
+
+	t.Run("binding survives validation", func(t *testing.T) {
+		_, svc, orgID, signingKey := setup(t)
+
+		_, rawKey, err := svc.Create(ctx, orgID, CreateAPIKeyRequest{
+			Name:          "Node",
+			Scopes:        []string{"keys:sign"},
+			AllowedKeyIDs: []uuid.UUID{signingKey.ID},
+		})
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		validated, err := svc.Validate(ctx, rawKey)
+		if err != nil {
+			t.Fatalf("Validate() error = %v", err)
+		}
+		if len(validated.AllowedKeyIDs) != 1 || validated.AllowedKeyIDs[0] != signingKey.ID {
+			t.Errorf("AllowedKeyIDs = %v, want %v", validated.AllowedKeyIDs, signingKey.ID)
+		}
+		if !AllowsKey(WithAPIKeyIdentity(ctx, APIKeyIdentity{KeyID: validated.ID, AllowedKeyIDs: validated.AllowedKeyIDs}), signingKey.ID) {
+			t.Error("AllowsKey() = false for the bound key")
+		}
+	})
+
+	t.Run("unbound key stays unrestricted", func(t *testing.T) {
+		_, svc, orgID, signingKey := setup(t)
+
+		key, _, err := svc.Create(ctx, orgID, CreateAPIKeyRequest{
+			Name:   "Deployment Orchestrator",
+			Scopes: []string{"keys:sign", "keys:read"},
+		})
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		if key.IsBound() {
+			t.Error("IsBound() = true, want false")
+		}
+		if !AllowsKey(WithAPIKeyIdentity(ctx, APIKeyIdentity{KeyID: key.ID, AllowedKeyIDs: key.AllowedKeyIDs}), signingKey.ID) {
+			t.Error("AllowsKey() = false for a credential without a binding")
+		}
+	})
+}

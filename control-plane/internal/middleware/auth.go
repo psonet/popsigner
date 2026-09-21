@@ -105,6 +105,11 @@ func RequireScope(requiredScopes ...string) func(next http.Handler) http.Handler
 				scopeSet[s] = true
 			}
 
+			if scopeSet["*"] {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			for _, required := range requiredScopes {
 				if scopeSet[required] {
 					next.ServeHTTP(w, r)
