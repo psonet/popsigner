@@ -398,11 +398,11 @@ func (c *Client) GetMetadata(uid string) (*service.KeyMetadata, error) {
 
 // ImportKey imports a key into OpenBao.
 func (c *Client) ImportKey(uid string, ciphertext string, exportable bool) (pubKey []byte, address string, ethAddress string, err error) {
-	url := fmt.Sprintf("%s/v1/%s/import/%s", c.address, c.mountPath, uid)
+	url := fmt.Sprintf("%s/v1/%s/keys/%s/import", c.address, c.mountPath, uid)
 
 	body := map[string]interface{}{
-		"private_key": ciphertext,
-		"exportable":  exportable,
+		"ciphertext": ciphertext,
+		"exportable": exportable,
 	}
 
 	jsonBody, err := json.Marshal(body)
