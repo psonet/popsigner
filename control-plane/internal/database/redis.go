@@ -77,20 +77,30 @@ func (r *Redis) Incr(ctx context.Context, key string) (int64, error) {
 	return r.client.Incr(ctx, key).Result()
 }
 
-// IncrWithExpire increments a key and sets expiration if it doesn't exist.
-func (r *Redis) IncrWithExpire(ctx context.Context, key string, expiration time.Duration) (int64, error) {
-	pipe := r.client.Pipeline()
-	incr := pipe.Incr(ctx, key)
-	pipe.Expire(ctx, key, expiration)
-	_, err := pipe.Exec(ctx)
+// incrWindow counts a hit and starts the key's expiry only when the key is created (or has
+// lost its expiry), so a steady caller cannot keep one window alive by re-arming the TTL.
+var incrWindow = redis.NewScript(`
+local n = redis.call('INCR', KEYS[1])
+if n == 1 or redis.call('PTTL', KEYS[1]) < 0 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return {n, redis.call('PTTL', KEYS[1])}
+`)
+
+// IncrWithExpire increments a key within a fixed window of the given length and reports the
+// count and how long the current window still has to run.
+func (r *Redis) IncrWithExpire(ctx context.Context, key string, expiration time.Duration) (int64, time.Duration, error) {
+	res, err := incrWindow.Run(ctx, r.client, []string{key}, expiration.Milliseconds()).Int64Slice()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return incr.Val(), nil
+	if len(res) != 2 {
+		return 0, 0, fmt.Errorf("unexpected reply from the window script: %v", res)
+	}
+	return res[0], time.Duration(res[1]) * time.Millisecond, nil
 }
 
 // SetNX sets a key only if it doesn't exist.
 func (r *Redis) SetNX(ctx context.Context, key string, value interface{}, expiration time.Duration) (bool, error) {
 	return r.client.SetNX(ctx, key, value, expiration).Result()
 }
-

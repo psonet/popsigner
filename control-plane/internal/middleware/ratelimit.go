@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"math"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -38,10 +39,12 @@ func RateLimit(redis *database.Redis, cfg RateLimitConfig) func(next http.Handle
 			ctx := r.Context()
 			windowDuration := time.Minute
 
-			// Count the request against every bucket it belongs to
+			// Count the request against every bucket it belongs to; the fullest bucket decides,
+			// and its window is the one the reset headers describe.
 			var count int64
+			var resetIn time.Duration
 			for _, bucket := range rateLimitBuckets(r) {
-				bucketCount, err := redis.IncrWithExpire(ctx, fmt.Sprintf("ratelimit:%s", bucket), windowDuration)
+				bucketCount, bucketReset, err := redis.IncrWithExpire(ctx, fmt.Sprintf("ratelimit:%s", bucket), windowDuration)
 				if err != nil {
 					// On Redis error, allow the request but log the error
 					next.ServeHTTP(w, r)
@@ -49,6 +52,7 @@ func RateLimit(redis *database.Redis, cfg RateLimitConfig) func(next http.Handle
 				}
 				if bucketCount > count {
 					count = bucketCount
+					resetIn = bucketReset
 				}
 			}
 
@@ -59,7 +63,7 @@ func RateLimit(redis *database.Redis, cfg RateLimitConfig) func(next http.Handle
 			}
 
 			// Get TTL for reset time
-			resetTime := time.Now().Add(windowDuration).Unix()
+			resetTime := time.Now().Add(resetIn).Unix()
 
 			// Set rate limit headers
 			w.Header().Set("X-RateLimit-Limit", strconv.Itoa(limit))
@@ -68,7 +72,7 @@ func RateLimit(redis *database.Redis, cfg RateLimitConfig) func(next http.Handle
 
 			// Check if rate limit exceeded
 			if int(count) > limit+cfg.BurstSize {
-				w.Header().Set("Retry-After", strconv.Itoa(60))
+				w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(resetIn.Seconds()))))
 				response.Error(w, apierrors.ErrRateLimited)
 				return
 			}
@@ -138,7 +142,7 @@ func RateLimitByKey(redis *database.Redis, cfg RateLimitConfig, keyFunc func(*ht
 			ctx := r.Context()
 			windowDuration := time.Minute
 
-			count, err := redis.IncrWithExpire(ctx, key, windowDuration)
+			count, resetIn, err := redis.IncrWithExpire(ctx, key, windowDuration)
 			if err != nil {
 				next.ServeHTTP(w, r)
 				return
@@ -150,14 +154,14 @@ func RateLimitByKey(redis *database.Redis, cfg RateLimitConfig, keyFunc func(*ht
 				remaining = 0
 			}
 
-			resetTime := time.Now().Add(windowDuration).Unix()
+			resetTime := time.Now().Add(resetIn).Unix()
 
 			w.Header().Set("X-RateLimit-Limit", strconv.Itoa(limit))
 			w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
 			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(resetTime, 10))
 
 			if int(count) > limit+cfg.BurstSize {
-				w.Header().Set("Retry-After", strconv.Itoa(60))
+				w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(resetIn.Seconds()))))
 				response.Error(w, apierrors.ErrRateLimited)
 				return
 			}
